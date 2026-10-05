@@ -1077,8 +1077,10 @@ end
 @testset "Condensed regular assembly matches the shared CPU assembly" begin
     # The condensed solver runs its own fork of the CPU regular assembly so it can be optimised
     # without touching the path every other backend shares. This is the contract that makes that
-    # safe: bitwise-identical operators, across every symmetry mode, cached and uncached. Any
+    # safe: operators agree to round-off, across every symmetry mode, cached and uncached. Any
     # optimisation added to the fork has to keep this passing.
+    entrywise_assembly_matches(candidate, reference) =
+        maximum(abs, candidate .- reference) <= 1.0f-5 * maximum(abs, reference)
     rule = triangle_rule(Float32, 2)
     k = Float32(2pi * 1000.0 / 343.0)
     # Each symmetry mode needs a mesh that actually lies in its fundamental domain: the half mesh
@@ -1103,14 +1105,19 @@ end
             skip_singular=false, singular_order=2, element_indices=element_indices,
             singular_cache=singular_cache, symmetry_mode=symmetry,
         )
-        # With no images the fused sweep reduces to the base sweep, so it must be bitwise
-        # identical. With images it sums each pair's contributions before scattering instead of
-        # depositing them across four separate passes, which reorders the floating-point
-        # summation -- equal to round-off, not bit for bit. Both halves are asserted so a
-        # regression cannot hide behind the looser bound.
+        # With no images the two loops do the same arithmetic but are compiled separately.
+        # Paired AVX-512/masked runs measured 201 differing double-layer entries (up to 256
+        # ULP) and 205 adjoint entries (up to 148 ULP) from near-cancelling dot(r_vec, normal).
+        # A sapphirerapids probe measured a worst double-layer gap of 3.55e-15 against a
+        # 2.0e-12 floor; see scripts/avx512_condensed_probe.jl and avx512_codegen_assay.jl.
+        # Bound EVERY entry absolutely by 1e-5 of the reference operator's largest entry:
+        # a norm can hide isolated defects, while a per-entry relative bound over-penalises
+        # near-cancellation (the measured worst relative gap was 1.57e-5).
+        # With images, summing contributions before scattering reorders the arithmetic by
+        # design, so keep the existing norm bound there.
         for op in (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
             if symmetry == :off
-                @test getproperty(forked, op) == getproperty(shared, op)
+                @test entrywise_assembly_matches(getproperty(forked, op), getproperty(shared, op))
             else
                 @test getproperty(forked, op) ≈ getproperty(shared, op) rtol = 1.0f-5
             end
@@ -1136,7 +1143,7 @@ end
         )
         for op in (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
             if symmetry == :off
-                @test getproperty(forked_cached, op) == getproperty(shared_cached, op)
+                @test entrywise_assembly_matches(getproperty(forked_cached, op), getproperty(shared_cached, op))
             else
                 @test getproperty(forked_cached, op) ≈ getproperty(shared_cached, op) rtol = 1.0f-5
             end
@@ -1145,6 +1152,20 @@ end
         # data, only the provenance of the reflected element sets differs.
         for op in (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
             @test getproperty(forked_cached, op) == getproperty(forked, op)
+        end
+
+        if symmetry == :off
+            # A missing quadrature contribution could corrupt just one entry. A 0.1% error
+            # at the operator's largest entry is 100 times the floor and must be rejected,
+            # for every operator in both paths, using the same predicate as the positive gate.
+            for (candidate, reference) in ((forked, shared), (forked_cached, shared_cached))
+                for op in (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
+                    expected = getproperty(reference, op)
+                    corrupted = copy(getproperty(candidate, op))
+                    corrupted[argmax(abs.(expected))] += 1.0f-3 * maximum(abs, expected)
+                    @test !entrywise_assembly_matches(corrupted, expected)
+                end
+            end
         end
     end
 
