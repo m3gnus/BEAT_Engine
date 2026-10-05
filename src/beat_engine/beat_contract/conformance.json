@@ -104,6 +104,73 @@
       "changes": []
     },
     {
+      "name": "v2_rigid_translation_source",
+      "valid": true,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "contract_version"
+          ],
+          "value": 2
+        },
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "parameters"
+          ],
+          "value": {
+            "motion_profile": "rigid_translation",
+            "motion_axis": [
+              1,
+              -2,
+              3
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "v1_motion_profile_refused",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "parameters"
+          ],
+          "value": {
+            "motion_profile": "uniform_normal"
+          }
+        }
+      ]
+    },
+    {
+      "name": "v1_motion_axis_refused",
+      "valid": false,
+      "changes": [
+        {
+          "path": [
+            "compiled_system",
+            "components",
+            0,
+            "parameters"
+          ],
+          "value": {
+            "motion_axis": [
+              0,
+              0,
+              1
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "producer_metadata_is_optional_and_extensible",
       "valid": true,
       "changes": [
@@ -193,7 +260,7 @@
             "compiled_system",
             "contract_version"
           ],
-          "value": 2
+          "value": 3
         }
       ]
     },

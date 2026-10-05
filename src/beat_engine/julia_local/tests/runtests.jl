@@ -84,6 +84,7 @@ include(joinpath(@__DIR__, "speaker_rom_tests.jl"))
 include(joinpath(@__DIR__, "coupled_condensed_tests.jl"))
 include(joinpath(@__DIR__, "cpu_simd_kernel_tests.jl"))
 include(joinpath(@__DIR__, "phasor_tests.jl"))
+include(joinpath(@__DIR__, "axial_source_tests.jl"))
 
 @testset "cpu BLAS thread policy" begin
     @test beat_cpu_blas_thread_count(441; available_threads=16) == 1

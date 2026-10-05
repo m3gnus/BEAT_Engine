@@ -7,7 +7,7 @@ can construct JSON requests without importing Boundary Lab models, Qt, or NumPy.
 ## Authoritative artifacts and versions
 
 - [JSON Schema](../src/beat_engine/beat_contract/system-v1.schema.json): request
-  v1 at `urn:beat-engine:system-solve:1`; compiled system v1 at its
+  v1 at `urn:beat-engine:system-solve:1`; compiled system v1 and v2 at its
   `#/$defs/compiled_system` fragment.
 - [Independent example](../src/beat_engine/beat_contract/example-exterior-request.json):
   a prescribed-velocity exterior request. Mesh filenames are illustrative; supply
@@ -26,13 +26,14 @@ must additionally be finite; NaN and infinity are never valid JSON extensions.
 | Version field | Current value | Meaning |
 |---|---:|---|
 | Request `schema_version` | 1 | Solve-request envelope |
-| Compiled system `contract_version` | 1 | Compiled graph and mesh/topology representation |
+| Compiled system `contract_version` | 1 or 2 | V2 requires explicit support for source-motion parameters; v1 remains the uniform-normal baseline |
 | Frequency result `schema_version` | 2 | Existing typed binary array representation |
 | Optional `source_model_version` | Producer-defined positive integer | Advisory producer provenance only |
 
-No numerical field meanings changed in defining this contract, so the existing
-versions remain valid. The application no longer defines the compiled-system
-version independently. Request readers reject missing, fractional, boolean, or
+Compiled-system v1 retains its original uniform-normal source semantics. V2
+adds opt-in source-motion fields while retaining existing normal-source requests. The
+application does not define the compiled-system version independently. Request
+readers reject missing, fractional, boolean, or
 unsupported versions before coercing data or opening mesh files. Integral JSON
 numbers such as `1.0` are accepted as integers, consistent with JSON Schema.
 
@@ -88,6 +89,57 @@ They do not select formulations or define the authoring-project schema. Existing
 metadata used for result interpretation, such as area normalization, is preserved.
 Producers may put descriptive additions in metadata; numerical features must use
 their defined engine fields/options and satisfy backend capability checks.
+
+### Exterior ideal-velocity-source motion
+
+An `ideal_velocity_source` with a `normal_velocity` port prescribes a unit
+1 m/s velocity basis. By default, each owned moving boundary has uniform
+outward-normal velocity; the optional positive `boundary_motion_weights` map
+multiplies that basis by boundary ID. Legacy requests without either newly
+reserved `motion_profile` or `motion_axis` field keep their numerical arithmetic
+and byte-identical outputs. Default-path allocation is not identical to v1;
+numerical compatibility does not promise identical execution or allocation.
+
+For a rigid piston moving along a fixed global axis, set component parameters
+`motion_profile: "rigid_translation"` and `motion_axis: [x, y, z]`, and set
+`compiled_system.contract_version` to `2`. The axis
+must be finite and nonzero and is normalized by the worker. On each tagged
+triangle the signed normal velocity is the boundary weight times
+`dot(face_normal, normalized_motion_axis)` m/s. A face tangent to the motion
+has zero velocity; a face whose normal opposes it has negative velocity. The
+same projection weights the pressure integral reported as
+`radiation_impedance` (generalized force per 1 m/s), so its unit remains N·s/m.
+Each source component carries its own axis, independent of the observation
+frame and of other sources. A component may own several boundaries only when
+they share that rigid motion. Sources with different axes must be separate
+components and ports; the client mixes their independent complex responses.
+The worker never infers, snaps, flips, or takes the absolute value of an axis.
+Reversing an axis reverses its Neumann drive and pressure response; the
+generalized impedance remains unchanged because the force projection also
+reverses. The axis uses the global mesh coordinate frame, after mesh placement.
+`motion_axis` without the rigid-translation profile is an error.
+A v1 ideal-source request carrying either reserved field is now refused by
+design, including `motion_profile: "uniform_normal"` without an axis. This ensures
+older v1-only workers reject v2 axial requests even when a caller bypasses
+capability negotiation and submits raw JSON.
+
+For a physical x/xy symmetry reduction the axis must lie in every symmetry
+plane used (X=0 for x; X=0 and Y=0 for xy). A standalone y reduction is not
+supported by the current exterior solver. Rigid-ground imaging is not a physical radiator copy and does not
+impose that restriction. Only exterior BEM ideal sources support this profile;
+interior/coupled ideal sources reject it. The worker must advertise
+`exterior_source_profiles: ["uniform_normal", "rigid_translation"]` before a
+client submits the rigid profile. Older workers without this capability are
+rejected by negotiation, even though their v1 schema would structurally accept
+the open parameters object.
+
+CPU operator assembly and Metal direct/operator assembly consume the same
+projected Neumann columns. Deployment boundary solves already accept signed
+complex `boundary_neumann` traces: pass the resulting face trace in the deployed
+mesh's face order, with its time convention and placement preserved. Deployment
+does not interpret compiled component axes. `interface_radiated_pressure` is a
+coupled-system output and cannot be requested for an exterior-only source;
+coupled electrodynamic transducers retain their existing motion-axis contract.
 
 ## Coordinates, paths, topology, and complex values
 

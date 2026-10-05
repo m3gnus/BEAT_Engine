@@ -36,6 +36,20 @@ const CONTRACT_CORPUS = JSON.parsefile(joinpath(@__DIR__, "..", "..", "beat_cont
     end
 end
 
+@testset "compiled v2 axial source and retained v1 normal source" begin
+    request = deepcopy(CONTRACT_CORPUS["base_request"])
+    @test validate_system_request(request) === nothing
+    request["compiled_system"]["contract_version"] = 2
+    @test validate_system_request(request) === nothing
+    source = request["compiled_system"]["components"][1]
+    source["parameters"] = Dict("motion_profile" => "rigid_translation", "motion_axis" => [0, 0, 1])
+    @test validate_system_request(request) === nothing
+    request["compiled_system"]["contract_version"] = 1
+    @test_throws ErrorException validate_system_request(request)
+    source["parameters"] = Dict("motion_axis" => [0, 0, 1])
+    @test_throws ErrorException validate_system_request(request)
+end
+
 @testset "BEAT identity without Git" begin
     mktempdir() do directory
         source = joinpath(@__DIR__, "..", "src", "BeatEngineProvenance.jl")
@@ -65,7 +79,7 @@ end
     info = worker_ready(Dict("cpu" => Dict("available" => true, "reason" => "")))
     @test info["protocol"]["version"] == 1
     @test info["contracts"]["system_request"] == [1]
-    @test info["contracts"]["compiled_system"] == [1]
+    @test info["contracts"]["compiled_system"] == [1, 2]
     @test info["contracts"]["system_result"] == [2]
     @test info["runtime"]["julia_version"] == string(VERSION)
     @test length(info["engine"]["source_sha256"]) == 64

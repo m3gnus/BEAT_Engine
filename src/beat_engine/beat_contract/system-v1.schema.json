@@ -384,7 +384,10 @@
         },
         "contract_version": {
           "type": "integer",
-          "const": 1
+          "enum": [
+            1,
+            2
+          ]
         },
         "meshes": {
           "type": "array",

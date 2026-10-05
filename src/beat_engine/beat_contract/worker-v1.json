@@ -13,7 +13,8 @@
       1
     ],
     "compiled_system": [
-      1
+      1,
+      2
     ],
     "system_result": [
       2
@@ -37,6 +38,10 @@
     "exterior_bem",
     "interior_fem",
     "coupled_fem_bem_lem"
+  ],
+  "exterior_source_profiles": [
+    "uniform_normal",
+    "rigid_translation"
   ],
   "cancellation": "marker_file",
   "field_cache": {

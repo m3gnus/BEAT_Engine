@@ -33,6 +33,11 @@ function validate_compiled_ground_volume!(mesh, symmetry_mode; tolerance::Real=1
     return nothing
 end
 
+"""Signed face projection for an explicitly oriented rigid source."""
+exterior_motion_factor(excitation, normal, ::Type{T}) where {T<:AbstractFloat} =
+    get(excitation, :motion_axis, nothing) === nothing ? one(T) :
+    T(dot(normal, excitation.motion_axis))
+
 """Radiation impedance scales by real symmetry copies, not image sources."""
 function exterior_component_impedance(mesh, pressure, excitation, symmetry_mode, ::Type{T}) where {T<:AbstractFloat}
     force = zero(Complex{T})
@@ -42,7 +47,9 @@ function exterior_component_impedance(mesh, pressure, excitation, symmetry_mode,
         haskey(amplitude_by_tag, tag) || continue
         face = mesh.faces[face_index]
         average_pressure = (pressure[face[1]] + pressure[face[2]] + pressure[face[3]]) / T(3)
-        force += average_pressure * T(mesh.areas[face_index]) * amplitude_by_tag[tag]
+        contribution = average_pressure * T(mesh.areas[face_index]) * amplitude_by_tag[tag]
+        force += get(excitation, :motion_axis, nothing) === nothing ? contribution :
+            contribution * exterior_motion_factor(excitation, mesh.normals[face_index], T)
     end
     real_radiator_count = symmetry_mode == :ground ? 1 : symmetry_reduction_factor(symmetry_mode)
     return force * T(real_radiator_count)

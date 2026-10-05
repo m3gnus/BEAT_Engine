@@ -111,3 +111,22 @@ def test_compiled_contract_requires_version_even_without_request():
     del system["contract_version"]
     with pytest.raises(ValueError, match="contract_version"):
         validate_compiled_system(system)
+
+
+def test_axial_source_requires_compiled_v2_and_v1_normal_remains_valid():
+    request = copy.deepcopy(CORPUS["base_request"])
+    source = request["compiled_system"]["components"][0]
+    validate_solve_request(request)
+    request["compiled_system"]["contract_version"] = 2
+    validate_solve_request(request)
+    source["parameters"] = {"motion_profile": "rigid_translation", "motion_axis": [0, 0, 1]}
+    validate_solve_request(request)
+    validate_compiled_system(request["compiled_system"])
+    request["compiled_system"]["contract_version"] = 1
+    with pytest.raises(ValueError, match="contract version 2"):
+        validate_solve_request(request)
+    with pytest.raises(ValueError, match="contract version 2"):
+        validate_compiled_system(request["compiled_system"])
+    source["parameters"] = {"motion_axis": [0, 0, 1]}
+    with pytest.raises(ValueError, match="contract version 2"):
+        validate_solve_request(request)

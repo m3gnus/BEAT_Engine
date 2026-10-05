@@ -714,7 +714,7 @@ function exterior_quadrature_selection(options, mesh::BoundaryMesh{T}, frequency
     return (order=order, mode=mode, mesh_stat=mesh_stat, area=area, length=element_length, kh=kh)
 end
 
-function exterior_excitations(ports, components, boundaries, boundary_tag_by_id, exterior_region, ::Type{T}) where {T<:AbstractFloat}
+function exterior_excitations(ports, components, boundaries, boundary_tag_by_id, exterior_region, symmetry_mode, ::Type{T}) where {T<:AbstractFloat}
     excitations = NamedTuple[]
     for port_id in String.(ports)
         port = object_by_id(components.ports, port_id, "excitation port")
@@ -726,7 +726,53 @@ function exterior_excitations(ports, components, boundaries, boundary_tag_by_id,
             "Exterior excitation port $port_id must reference an ideal velocity source.",
         )
         parameters = get(component, "parameters", Dict{String,Any}())
+        explicit_motion = haskey(parameters, "motion_profile") || haskey(parameters, "motion_axis")
+        if explicit_motion
+            supported_parameters = Set(("boundary_motion_weights", "motion_profile", "motion_axis"))
+            unsupported = setdiff(Set(String.(keys(parameters))), supported_parameters)
+            isempty(unsupported) || error(
+                "Exterior ideal velocity source has unsupported parameters: " * join(sort!(collect(unsupported)), ", "),
+            )
+        end
+        motion_profile = String(get(parameters, "motion_profile", "uniform_normal"))
+        motion_profile in ("uniform_normal", "rigid_translation") || error(
+            "Exterior ideal velocity source motion_profile must be uniform_normal or rigid_translation.",
+        )
+        motion_axis = if motion_profile == "rigid_translation"
+            raw_axis = get(parameters, "motion_axis", nothing)
+            raw_axis isa AbstractVector && length(raw_axis) == 3 || error(
+                "Rigid-translation source requires a three-component motion_axis.",
+            )
+            all(value -> value isa Real && !(value isa Bool) && isfinite(value), raw_axis) || error(
+                "Rigid-translation source motion_axis must contain three finite numbers.",
+            )
+            # An axis specifies direction, not speed. Normalize before converting
+            # to solve precision so finite large/tiny directions work in Float32.
+            axis = SVector{3,Float64}(Float64.(raw_axis))
+            axis_scale = maximum(abs, axis)
+            all(isfinite, axis) && axis_scale > 0.0 || error(
+                "Rigid-translation source motion_axis must be finite and nonzero.",
+            )
+            axis /= axis_scale
+            axis = SVector{3,T}(axis / norm(axis))
+            for (mode, coordinate) in ((:x, 1), (:y, 2), (:xy, 1), (:xy, 2))
+                symmetry_mode == mode && abs(axis[coordinate]) > T(1e-8) && error(
+                    "Rigid-translation source motion_axis must lie in the physical symmetry planes.",
+                )
+            end
+            axis
+        else
+            haskey(parameters, "motion_axis") && error(
+                "motion_axis requires motion_profile=rigid_translation.",
+            )
+            nothing
+        end
         raw_weights = get(parameters, "boundary_motion_weights", Dict{String,Any}())
+        raw_weights isa AbstractDict || error("boundary_motion_weights must be an object.")
+        if explicit_motion
+            unrelated = setdiff(Set(String.(keys(raw_weights))), Set(String.(component["boundary_ids"])))
+            isempty(unrelated) || error("Exterior boundary motion weights reference unrelated boundaries.")
+        end
         tags = Int[]
         amplitudes = T[]
         for boundary_id in String.(component["boundary_ids"])
@@ -747,7 +793,8 @@ function exterior_excitations(ports, components, boundaries, boundary_tag_by_id,
         isempty(tags) && error(
             "Exterior component $(repr(String(component["id"]))) has no moving boundaries.",
         )
-        push!(excitations, (port_id=port_id, component_id=String(component["id"]), tags=tags, amplitudes=amplitudes))
+        excitation = (port_id=port_id, component_id=String(component["id"]), tags=tags, amplitudes=amplitudes)
+        push!(excitations, motion_axis === nothing ? excitation : merge(excitation, (motion_axis=motion_axis,)))
     end
     return excitations
 end
@@ -757,7 +804,10 @@ function exterior_neumann(mesh, excitation, density::T, omega::T) where {T<:Abst
     for (tag, amplitude) in zip(excitation.tags, excitation.amplitudes)
         for face_index in eachindex(mesh.faces)
             mesh.physical_tags[face_index] == tag || continue
-            values[face_index] = neumann_scale(density, omega) * amplitude
+            value = neumann_scale(density, omega) * amplitude
+            # Keep the original arithmetic when the profile is absent.
+            values[face_index] = get(excitation, :motion_axis, nothing) === nothing ? value :
+                value * exterior_motion_factor(excitation, mesh.normals[face_index], T)
         end
     end
     return values
@@ -905,6 +955,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         boundaries,
         bem_domain.boundary_tag_by_id,
         unbounded_region,
+        symmetry_mode,
         FloatType,
     )
     mesh_setup_s = (time_ns() - mesh_setup_started) / 1.0e9
@@ -2414,6 +2465,16 @@ function solve_request_impl(request; event_mode=false)
 
     bounded_regions = [region for region in regions if String(region["kind"]) == "bounded_air"]
     unbounded_regions = [region for region in regions if String(region["kind"]) == "unbounded_air"]
+    if !isempty(bounded_regions)
+        for component in components
+            String(component["kind"]) == "ideal_velocity_source" || continue
+            parameters = component["parameters"]
+            get(parameters, "motion_profile", "uniform_normal") == "uniform_normal" &&
+                !haskey(parameters, "motion_axis") && continue
+            error("Rigid-translation ideal sources currently require an exterior BEM solve.")
+        end
+    end
+
     for output in get(request, "outputs", Any[])
         if String(output["quantity"]) == "interface_radiated_pressure"
             (!isempty(interfaces) && !isempty(bounded_regions) && !isempty(unbounded_regions)) ||

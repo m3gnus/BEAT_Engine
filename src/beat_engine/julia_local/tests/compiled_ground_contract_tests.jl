@@ -17,6 +17,15 @@ include(joinpath(@__DIR__, "..", "compiled_ground_contract.jl"))
     @test exterior_component_impedance(raised, pressure, excitation, :x, T) ≈ 2local_impedance
     @test exterior_component_impedance(raised, pressure, excitation, :xy, T) ≈ 4local_impedance
 
+    axial = (tags=[2], amplitudes=T[1], motion_axis=SVector{3,T}(0, 0, 1))
+    @test exterior_motion_factor(axial, SVector{3,T}(0, 0, 1), T) == one(T)
+    @test exterior_motion_factor(axial, SVector{3,T}(0, 0, -1), T) == -one(T)
+    @test exterior_motion_factor(axial, SVector{3,T}(1, 0, 0), T) == zero(T)
+    @test exterior_component_impedance(raised, pressure, axial, :off, T) == zero(Complex{T})
+    downward = (tags=[2], amplitudes=T[2], motion_axis=SVector{3,T}(0, -1, 0))
+    @test exterior_component_impedance(raised, pressure, downward, :off, T) ≈
+          Complex{T}(2 * raised.areas[1])
+
     straddling = BoundaryMesh(
         SVector{3,T}[(0, -0.1, 0), (1, 0.1, 0), (0, 0.1, 1)],
         [(1, 2, 3)], [2],

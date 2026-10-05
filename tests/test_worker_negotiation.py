@@ -37,6 +37,71 @@ def test_selects_current_formats_and_accepts_future_advertised_versions(ready, p
     assert negotiate_submission(ready, field, "bem_field") == {"protocol_version": 1, "field_array_schema_version": 1}
 
 
+def test_axial_source_requires_explicit_worker_capability(ready, payload):
+    source = payload["compiled_system"]["components"][0]
+    payload["compiled_system"]["contract_version"] = 2
+    source["parameters"] = {"motion_profile": "rigid_translation", "motion_axis": [0, 0, 1]}
+    old_ready = copy.deepcopy(ready)
+    old_ready.pop("exterior_source_profiles")
+    old_ready["contracts"]["compiled_system"] = [1]
+    with pytest.raises(WorkerCompatibilityError, match="compiled_system version 2"):
+        negotiate_submission(old_ready, payload, "solve")
+    old_ready["contracts"]["compiled_system"] = [1, 2]
+    with pytest.raises(WorkerCompatibilityError, match="source profile"):
+        negotiate_submission(old_ready, payload, "solve")
+    assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
+    payload["compiled_system"]["contract_version"] = 1
+    source["parameters"] = {}
+    old_ready["contracts"]["compiled_system"] = [1]
+    assert negotiate_submission(old_ready, payload, "solve")["result_schema_version"] == 2
+
+
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        "not_a_list_but_contains_rigid_translation",
+        None,
+        {},
+        ("rigid_translation",),
+        [""],
+        [" "],
+        ["rigid_translation", 1],
+        ["rigid_translation", True],
+    ],
+)
+def test_rejects_malformed_source_profile_announcements(ready, payload, profiles):
+    payload["compiled_system"]["contract_version"] = 2
+    payload["compiled_system"]["components"][0]["parameters"] = {
+        "motion_profile": "rigid_translation",
+        "motion_axis": [0, 0, 1],
+    }
+    ready["exterior_source_profiles"] = profiles
+    with pytest.raises(WorkerCompatibilityError, match="exterior_source_profiles"):
+        negotiate_submission(ready, payload, "solve")
+
+
+def test_missing_profiles_preserves_old_worker_normal_fallback(ready, payload):
+    ready.pop("exterior_source_profiles")
+    assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
+    ready["exterior_source_profiles"] = []
+    assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
+
+
+@pytest.mark.parametrize("kind", ["interior_fem", "coupled_fem_bem_lem"])
+def test_rigid_ideal_source_rejects_bounded_regions_before_submission(ready, payload, kind):
+    system = payload["compiled_system"]
+    system["contract_version"] = 2
+    system["components"][0]["parameters"] = {"motion_profile": "rigid_translation", "motion_axis": [1, 2, 3]}
+    if kind == "interior_fem":
+        system["regions"][0]["kind"] = "bounded_air"
+    else:
+        interior = copy.deepcopy(system["regions"][0])
+        interior.update(id="region:interior", kind="bounded_air")
+        system["regions"].append(interior)
+    with pytest.raises(WorkerCompatibilityError, match="exterior BEM solve"):
+        negotiate_submission(ready, payload, "solve")
+
+
 @pytest.mark.parametrize("version", [None, True, 1.0, 2, "1"])
 def test_rejects_incompatible_protocol_versions(ready, version):
     ready["protocol"]["version"] = version

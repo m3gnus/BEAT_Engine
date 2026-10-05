@@ -122,6 +122,18 @@ function references(values, available, path)
     end
 end
 
+function source_profile_version(system)
+    system["contract_version"] == 2 && return nothing
+    for component in system["components"]
+        component["kind"] == "ideal_velocity_source" || continue
+        parameters = component["parameters"]
+        haskey(parameters, "motion_profile") || haskey(parameters, "motion_axis") || continue
+        fail("compiled_system.components.$(component["id"]).parameters",
+            "source motion profiles require compiled-system contract version 2")
+    end
+    return nothing
+end
+
 function graph(system)
     validate_mesh_sources(system)
     collections = Dict()
@@ -158,6 +170,7 @@ end
 function validate_system_request(request)
     finite_json(request, "request")
     validate(request, SCHEMA["\$defs"]["solve_request"], "request")
+    source_profile_version(request["compiled_system"])
     graph(request["compiled_system"])
     references(request["excitation_port_ids"], Dict(port["id"] => port for port in request["compiled_system"]["excitation_ports"]), "request.excitation_port_ids")
     unique_ids([output["id"] for output in request["outputs"]], "request.outputs")

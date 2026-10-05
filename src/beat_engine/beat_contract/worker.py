@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import COMPILED_SYSTEM_VERSION, SYSTEM_RESULT_VERSION, SYSTEM_SOLVE_REQUEST_VERSION, validate_solve_request
+from . import SYSTEM_RESULT_VERSION, SYSTEM_SOLVE_REQUEST_VERSION, validate_solve_request
 
 WORKER_PROTOCOL_VERSION = 1
 FIELD_ARRAY_VERSION = 1
@@ -50,6 +50,13 @@ def validate_worker_ready(info: dict) -> None:
             isinstance(values, list) and all(isinstance(value, str) and value for value in values),
             f"invalid {name} capabilities.",
         )
+    if "exterior_source_profiles" in info:
+        profiles = info["exterior_source_profiles"]
+        _require(
+            isinstance(profiles, list)
+            and all(isinstance(profile, str) and bool(profile.strip()) for profile in profiles),
+            "invalid exterior_source_profiles capabilities; expected a list of non-empty strings.",
+        )
     backends = info.get("backends")
     _require(isinstance(backends, dict) and bool(backends), "missing backend availability.")
     for name, backend in backends.items():
@@ -71,7 +78,7 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
             _require(1 in contracts.get("mesh_data", []), "mesh_data version 1 is unavailable; update BEAT Engine.")
         for name, version in (
             ("system_request", SYSTEM_SOLVE_REQUEST_VERSION),
-            ("compiled_system", COMPILED_SYSTEM_VERSION),
+            ("compiled_system", request["compiled_system"]["contract_version"]),
             ("system_result", SYSTEM_RESULT_VERSION),
         ):
             _require(version in contracts[name], f"{name} version {version} is unavailable.")
@@ -96,6 +103,16 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
             else "coupled_fem_bem_lem"
         )
         _require(kind in info["solve_kinds"], f"solve kind {kind!r} is unavailable.")
+        for component in request["compiled_system"]["components"]:
+            if component["kind"] != "ideal_velocity_source":
+                continue
+            profile = component["parameters"].get("motion_profile", "uniform_normal")
+            if profile != "uniform_normal":
+                _require(kind == "exterior_bem", "rigid-translation ideal sources require an exterior BEM solve.")
+                _require(
+                    profile in info.get("exterior_source_profiles", ["uniform_normal"]),
+                    f"exterior source profile {profile!r} is unavailable; update the engine worker.",
+                )
         if "cancel_path" in request:
             _require(info.get("cancellation") == "marker_file", "marker-file cancellation is unavailable.")
         default_precision = "float32" if kind == "exterior_bem" else "float64"

@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-COMPILED_SYSTEM_VERSION = 1
+COMPILED_SYSTEM_VERSION = 2
 SYSTEM_SOLVE_REQUEST_VERSION = 1
 SYSTEM_RESULT_VERSION = 2
 SUPPORTED_SYSTEM_RESULT_VERSIONS = frozenset({1, SYSTEM_RESULT_VERSION})
@@ -117,6 +117,20 @@ def _mesh_validator():
     return module.validate_mesh_sources
 
 
+def _source_profile_version(system: dict) -> None:
+    if system["contract_version"] == 2:
+        return
+    for component in system["components"]:
+        if component["kind"] != "ideal_velocity_source":
+            continue
+        parameters = component["parameters"]
+        if "motion_profile" in parameters or "motion_axis" in parameters:
+            _fail(
+                f"compiled_system.components.{component['id']}.parameters",
+                "source motion profiles require compiled-system contract version 2",
+            )
+
+
 def _graph(system: dict) -> None:
     _mesh_validator()(system)
     collections = {}
@@ -156,12 +170,14 @@ def _graph(system: dict) -> None:
 def validate_compiled_system(raw: dict) -> None:
     _finite_json(raw, "compiled_system")
     _validate(raw, _schema()["$defs"]["compiled_system"], "compiled_system")
+    _source_profile_version(raw)
     _graph(raw)
 
 
 def validate_solve_request(raw: dict) -> None:
     _finite_json(raw, "request")
     _validate(raw, _schema()["$defs"]["solve_request"], "request")
+    _source_profile_version(raw["compiled_system"])
     _graph(raw["compiled_system"])
     _references(
         raw["excitation_port_ids"],

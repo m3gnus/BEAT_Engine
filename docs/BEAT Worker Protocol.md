@@ -19,6 +19,7 @@ then emits the resulting object as a single JSON line on stdout, with `type: rea
 | `operations` | `solve` and `bem_field` |
 | `precisions` | `float32` and `float64` |
 | `solve_kinds` | `exterior_bem`, `interior_fem`, `coupled_fem_bem_lem` |
+| `exterior_source_profiles` | List of non-empty strings naming supported ideal-velocity-source motion profiles; absent on older workers |
 | `backends` | Per-backend `available` boolean and optional explanatory `reason` |
 | `cancellation` | `marker_file`, for physical solves |
 | `field_cache` | Process lifetime, clearing conditions, and maximum entry count |
@@ -42,7 +43,7 @@ for each new process; subsequent device failures are normal job errors.
 Unknown additive handshake fields are allowed. Protocol version must be an integer
 equal to 1; booleans, strings, and floating-point tokens are rejected. Additional
 advertised contract versions are allowed. The current client selects request v1,
-compiled system v1, result v2, and field array v1. It never silently downgrades a
+the submitted compiled-system version (v1 or v2), result v2, and field array v1. It never silently downgrades a
 negotiated result to v1. Historical result decoding remains available separately.
 
 ## Commands and capability checks
@@ -76,6 +77,19 @@ Feature-specific numerical options, boundary/component support, mesh validity,
 and formulation restrictions remain validated by the solve plan and numerical
 implementation. The broad solve-kind capability is not a claim that every
 physical graph is supported.
+The `rigid_translation` exterior source profile is the explicit exception to
+the broad solve-kind check: clients require its advertised profile capability
+before sending the request. An older worker otherwise silently interprets
+the open component parameters as a uniform-normal source. Such requests must
+also declare compiled-system v2, so a v1-only worker rejects raw JSON even if
+the caller bypasses negotiation. A present `exterior_source_profiles` announcement
+must be a list of non-empty strings; a string containing a profile name is
+invalid. Missing announcements retain the `uniform_normal` fallback for older
+workers. Legacy v1 requests without either reserved `motion_profile` or
+`motion_axis` field still select v1 and retain their numerical arithmetic and
+byte-identical outputs. A v1 ideal-source request containing `motion_profile`
+(including `uniform_normal`) or `motion_axis` is now refused by design.
+Default-path allocation is not identical to v1.
 
 ## Events, cancellation, and process reuse
 
