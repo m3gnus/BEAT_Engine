@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "5080e8e3d61c8d9f57f2d8e340046de5560425b5"
+project_hash = "3b4f98f34c9b8e4e294c342f316297d6b50796f3"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -64,6 +64,12 @@ version = "0.6.1"
 [[deps.Base64]]
 uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 version = "1.11.0"
+
+[[deps.BeatEngineCudaBundle]]
+deps = ["CUDA", "JSON", "LinearAlgebra", "PrecompileTools", "Printf", "SparseArrays", "StaticArrays", "Statistics"]
+path = "../julia_engine/BeatEngineCudaBundle"
+uuid = "aa7a0c21-3b52-49c6-ab84-5144b7b391ac"
+version = "0.1.0"
 
 [[deps.CEnum]]
 git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"

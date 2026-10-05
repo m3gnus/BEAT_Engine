@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+import tomllib
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -20,6 +21,22 @@ def test_catalog_is_immutable_and_resolves_packaged_assets():
         assert (paths.project / "Project.toml").is_file()
         with pytest.raises(FrozenInstanceError):
             info.label = "changed"
+
+
+@pytest.mark.parametrize("backend", [info.backend_id for info in backend_catalog()])
+def test_every_backend_project_declares_its_bundle(backend):
+    paths = engine_paths(backend)
+    name = f"BeatEngine{backend.capitalize()}Bundle"
+    bundle = paths.root / "julia_engine" / name
+    project = tomllib.loads((paths.project / "Project.toml").read_text(encoding="utf-8"))
+    manifest = tomllib.loads((paths.project / "Manifest.toml").read_text(encoding="utf-8"))
+    bundle_project = tomllib.loads((bundle / "Project.toml").read_text(encoding="utf-8"))
+
+    assert project["deps"][name] == bundle_project["uuid"]
+    (entry,) = manifest["deps"][name]
+    assert entry["uuid"] == bundle_project["uuid"]
+    assert (paths.project / entry["path"]).resolve() == bundle.resolve()
+    assert (bundle / "src" / f"{name}.jl").is_file()
 
 
 def test_unknown_backend_is_not_redirected():
