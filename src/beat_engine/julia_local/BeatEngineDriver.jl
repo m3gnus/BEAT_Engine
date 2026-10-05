@@ -172,6 +172,111 @@ function regular_quadrature_selection(config, mesh::BoundaryMesh{T}, freq::T, so
     )
 end
 
+function near_correction_order_for_ratio(ratio::Real, top_order::Int)
+    rho = 2 * Float64(ratio)
+    rho <= 1.0 && return top_order
+    bernstein = rho + sqrt(rho * rho - 1)
+    required = ceil(Int, log(1.0e7) / (2 * log(bernstein)))
+    return clamp(required, 4, top_order)
+end
+"""Select disjoint close face pairs for opt-in source-request correction.
+
+The separation is measured relative to the sum of the faces' maximum vertex
+radii about their centroids. Spatial buckets bound the candidate search, and
+per-pair orders decrease with separation. The existing cache builder excludes
+singular pairs, which are already integrated with Duffy rules.
+"""
+function near_correction_selection(config, mesh::BoundaryMesh{T}, symmetry_mode::Symbol) where {T<:AbstractFloat}
+    Bool(get_value(config, "near_correction_enabled", false)) || return nothing
+    cutoff = Float64(get_value(config, "near_correction_cutoff", 2.0))
+    isfinite(cutoff) && cutoff > 0.0 || error("near_correction_cutoff must be finite and greater than zero.")
+    top_order = Int(get_value(config, "near_correction_order", 8))
+    top_order >= 4 || error("near_correction_order must be at least 4.")
+
+    face_count = length(mesh.faces)
+    face_count == 0 && return nothing
+    radii = [
+        maximum(norm(vertex - mesh.centroids[index]) for vertex in mesh.face_vertices[index])
+        for index in 1:face_count
+    ]
+    maximum(radii) > 0 || return nothing
+
+    identity_pairs = near_correction_pairs(mesh, radii, cutoff, top_order, nothing)
+    # A symmetric solve assembles each face against the mirror images of every
+    # other face as well, and those image pairs run closer than the identity
+    # ones -- a face a millimetre off the symmetry plane sits a hair from its
+    # own reflection. One cache carries one transform, so `:xy` needs three.
+    image_selections = Tuple{Any,Vector{Tuple{Int,Int,Int}}}[]
+    for transform in symmetry_image_transforms(symmetry_mode)
+        pairs = near_correction_pairs(mesh, radii, cutoff, top_order, transform)
+        pairs === nothing || push!(image_selections, (transform, pairs))
+    end
+    identity_pairs === nothing && isempty(image_selections) && return nothing
+    return (
+        identity_pairs=identity_pairs,
+        image_selections=image_selections,
+        cutoff=cutoff,
+        top_order=top_order,
+    )
+end
+
+"""Face pairs within `cutoff` combined face radii, optionally across a mirror.
+
+With `transform === nothing` this is the self-domain search and a face is never
+paired with itself; across a mirror the `i == j` pair is the one that matters
+most, because that is a face against its own reflection.
+"""
+function near_correction_pairs(
+    mesh::BoundaryMesh{T},
+    radii::Vector{T},
+    cutoff::Float64,
+    top_order::Int,
+    transform,
+) where {T<:AbstractFloat}
+    face_count = length(mesh.faces)
+    trial_centroids = transform === nothing ? mesh.centroids :
+        [reflect_point(transform, centroid) for centroid in mesh.centroids]
+
+    # Cell edge equals the largest search radius any pair can ask for, so the
+    # 27-cell neighbourhood of a face is guaranteed to hold every candidate.
+    cell = cutoff * 2 * maximum(radii)
+    buckets = Dict{NTuple{3,Int},Vector{Int}}()
+    cell_of(point) = (
+        Int(floor(point[1] / cell)),
+        Int(floor(point[2] / cell)),
+        Int(floor(point[3] / cell)),
+    )
+    for index in 1:face_count
+        push!(get!(() -> Int[], buckets, cell_of(trial_centroids[index])), index)
+    end
+
+    pairs = Tuple{Int,Int,Int}[]
+    for test_index in 1:face_count
+        base = cell_of(mesh.centroids[test_index])
+        test_centroid = mesh.centroids[test_index]
+        test_radius = radii[test_index]
+        for dx in -1:1, dy in -1:1, dz in -1:1
+            neighbours = get(buckets, (base[1] + dx, base[2] + dy, base[3] + dz), nothing)
+            neighbours === nothing && continue
+            for trial_index in neighbours
+                transform === nothing && trial_index == test_index && continue
+                scale = test_radius + radii[trial_index]
+                scale > 0 || continue
+                ratio = norm(test_centroid - trial_centroids[trial_index]) / scale
+                ratio <= cutoff || continue
+                # Coincident and adjacent pairs already carry a Duffy
+                # correction; the cache builder drops them either way, but
+                # skipping the self-domain ones here keeps the list small.
+                transform === nothing &&
+                    elements_are_adjacent(mesh.faces[test_index], mesh.faces[trial_index]) &&
+                    continue
+                push!(pairs, (test_index, trial_index, near_correction_order_for_ratio(ratio, top_order)))
+            end
+        end
+    end
+    return isempty(pairs) ? nothing : pairs
+end
+
 function mesh_inputs_from_config(config)
     meshes = get_value(config, "meshes", Any[])
     if !isempty(meshes)
@@ -774,6 +879,10 @@ function solve_request_impl(request)
     config = request["config"]
     symmetry_mode = symmetry_mode_from_config(config)
     beat_backend = beat_backend_from_request(request)
+    near_enabled = Bool(get_value(config, "near_correction_enabled", false))
+    near_enabled && beat_backend != :cpu && error(
+        "Source-request near-singular correction is supported only on the CPU backend.",
+    )
     rocm_assembly_mode = beat_backend == :rocm ? BeatEngineCore._normalized_rocm_assembly_mode(
         get_value(config, "rocm_assembly_mode", nothing),
     ) : nothing
@@ -846,12 +955,41 @@ function solve_request_impl(request)
     # The fused path has one regular kernel of its own, so a request for a
     # specific diagnostic kernel mode has to fall back to the four-operator
     # path or the request would be silently ignored.
+    # Near corrections are applied only by the four-operator path, so an
+    # enabled request must bypass fusion even when selection finds no pairs.
     fused_burton_miller = beat_backend in (:cpu, :metal) &&
+        !near_enabled &&
         get(ENV, "BLAB_BEAT_FUSED_BM", "1") != "0" &&
         (beat_backend != :metal || (metal_assembly_mode != :host_staged &&
             BeatEngineCore._normalized_metal_singular_mode() == :native &&
             BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather))
     singular_cache = build_singular_correction_cache(mesh, singular_order)
+    near_selection = near_correction_selection(config, mesh, Symbol(symmetry_mode))
+    near_correction_cache = nothing
+    image_near_correction_caches = nothing
+    if near_selection !== nothing
+        if near_selection.identity_pairs !== nothing
+            near_correction_cache = build_near_correction_cache(
+                mesh, near_selection.identity_pairs, near_selection.top_order,
+            )
+        end
+        image_near_correction_caches = [
+            build_near_correction_cache(
+                mesh, pairs, near_selection.top_order; trial_transform=transform,
+            )
+            for (transform, pairs) in near_selection.image_selections
+        ]
+        emit_event(
+            "status";
+            message=@sprintf(
+                "Near-singular correction within %.2f element radii: %d self-domain pair(s), %d mirror-image pair(s) across %d transform(s)",
+                near_selection.cutoff,
+                near_correction_cache === nothing ? 0 : near_correction_cache.pair_count,
+                sum(cache.pair_count for cache in image_near_correction_caches; init=0),
+                length(image_near_correction_caches),
+            ),
+        )
+    end
     device_cache = nothing
     device_singular_cache = nothing
     device_image_singular_cache = nothing
@@ -989,6 +1127,8 @@ function solve_request_impl(request)
             return_device=true,
             accelerator_quadrature=true,
             singular_cache=singular_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_caches,
             device_singular_cache=device_singular_cache,
             metal_assembly_mode=metal_assembly_mode,
             symmetry_mode=Symbol(symmetry_mode),
@@ -1131,6 +1271,8 @@ function solve_request_impl(request)
                     accelerator_quadrature=beat_backend != :cpu,
                     singular_cache=singular_cache,
                     cpu_cache=selected_cpu_assembly_cache,
+                    near_correction_cache=near_correction_cache,
+                    image_near_correction_cache=image_near_correction_caches,
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
                     rocm_assembly_mode=rocm_assembly_mode,
@@ -1297,6 +1439,13 @@ function solve_request_impl(request)
                         Float32(dense_solve_report.plan.lu_model_seconds),
                     "dense_solve_model_gmres_s" => dense_solve_report === nothing ? nothing :
                         Float32(dense_solve_report.plan.gmres_model_seconds),
+                    (near_enabled ? (
+                        "near_correction_enabled" => true,
+                        "near_pair_count" => operators.near_pair_count,
+                        "near_pair_quadrature_order" => operators.near_pair_quadrature_order,
+                        "near_image_transform_count" => image_near_correction_caches === nothing ? 0 :
+                            length(image_near_correction_caches),
+                    ) : ())...,
                     "backend" => String(beat_backend),
                     "symmetry" => symmetry_mode,
                     "regular_assembly_mode" => string(assembly_payload.kind === :fused ?

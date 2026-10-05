@@ -129,3 +129,22 @@ opt-in: set `BLAB_VALIDATE_GROUND=1` when running
 `scripts/validate_metal_symmetry.jl` with the `julia_metal` project on a functional
 Metal device. They cover lifted `sample_half.msh` and resting-edge
 `sample_quarter.msh` with the existing operator, pressure and field bounds.
+
+## CPU near-correction invariant
+
+`runtests.jl` includes `near_correction_rule_independence.jl`, which can also run
+standalone with the `julia_local` project. It corrects every disjoint pair on
+full, half and quarter octahedral surfaces. All four corrected q1/q4 operators
+must agree within 1e-12 relative error for `off`, `x` and `xy`; uncorrected q1/q4
+controls must differ by more than 1e-6. The xy case uses all three image caches.
+
+Source requests opt in with `config.near_correction_enabled=true` on CPU.
+`near_correction_cutoff` defaults to 2.0 and measures centroid separation divided
+by the sum of each face's maximum vertex radius about its centroid.
+`near_correction_order` defaults to 8 (minimum 4); individual pair orders decrease
+with separation. Singular pairs retain their existing Duffy correction. Enabled
+requests use four-operator assembly, bypassing the fused Burton-Miller path,
+and report applied pair count, maximum order and selected image-transform count
+in result diagnostics. The source option rejects CUDA, ROCm and Metal before
+loading geometry or devices. Existing explicit compiled proximity inputs and
+CUDA single-cache entry points retain their contracts.
