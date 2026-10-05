@@ -21,6 +21,8 @@ using Printf
 using Statistics
 using StaticArrays
 
+include(joinpath(@__DIR__, "compiled_ground_contract.jl"))
+
 function emit_event(event_type::String; kwargs...)
     payload = Dict{String,Any}("type" => event_type)
     for (key, value) in kwargs
@@ -87,7 +89,7 @@ end
 
 function symmetry_mode_from_config(config)
     mode = lowercase(strip(String(get_value(config, "symmetry", "off"))))
-    mode in ("off", "x", "xy") || error("Unsupported symmetry mode: $(mode). Expected off, x, or xy.")
+    mode in ("off", "x", "xy", "ground") || error("Unsupported symmetry mode: $(mode). Expected off, x, xy, or ground.")
     return mode
 end
 
@@ -666,7 +668,7 @@ function radiator_drives_from_channel_basis(radiators, channels, freq, correctio
 end
 
 function impedance_for_radiators(mesh, element_mesh_ids, pressure, radiators, drives, ::Type{T}; symmetry_mode::Symbol=:off) where {T<:AbstractFloat}
-    force_scale = eltype(pressure)(symmetry_reduction_factor(symmetry_mode))
+    force_scale = eltype(pressure)(physical_radiator_count(symmetry_mode))
     impedance = Vector{Vector{Float32}}()
     for (radiator_index, radiator) in enumerate(radiators)
         drive = drives[radiator_index]
@@ -808,6 +810,10 @@ function solve_request_impl(request)
     mesh, element_mesh_ids = load_combined_mesh(mesh_inputs, FloatType)
     mesh = snap_symmetry_planes(mesh, Symbol(symmetry_mode))
     validate_symmetry_fundamental_domain!(mesh, Symbol(symmetry_mode))
+    validate_compiled_ground_domain!(
+        mesh, Symbol(symmetry_mode);
+        min_clearance_m=Float64(get_value(config, "ground_plane_min_clearance_m", 0.0)),
+    )
     validate_radiator_elements(mesh, element_mesh_ids, radiators)
     p1_space = build_p1_space(mesh)
     dp0_space = build_dp0_space(mesh)

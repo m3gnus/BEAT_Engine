@@ -11,6 +11,13 @@ include(joinpath(@__DIR__, "..", "compiled_ground_contract.jl"))
 
     @test validate_compiled_ground_domain!(raised, :ground) === nothing
     @test validate_compiled_ground_domain!(raised, :off) === nothing
+    @test validate_compiled_ground_domain!(raised, :ground; min_clearance_m=1.0) === nothing
+    @test_throws "clearance" validate_compiled_ground_domain!(raised, :ground; min_clearance_m=1.1)
+    for clearance in (-1.0, NaN, Inf)
+        @test_throws "finite and non-negative" validate_compiled_ground_domain!(
+            raised, :ground; min_clearance_m=clearance,
+        )
+    end
     local_impedance = exterior_component_impedance(raised, pressure, excitation, :off, T)
     @test local_impedance ≈ Complex{T}(raised.areas[1])
     @test exterior_component_impedance(raised, pressure, excitation, :ground, T) ≈ local_impedance
@@ -44,6 +51,7 @@ include(joinpath(@__DIR__, "..", "compiled_ground_contract.jl"))
         [(1, 2, 3)], [2],
     )
     @test validate_compiled_ground_domain!(contact_edge, :ground) === nothing
+    @test_throws "clearance" validate_compiled_ground_domain!(contact_edge, :ground; min_clearance_m=0.01)
 
     raised_volume = (vertices=SVector{3,T}[(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)],)
     @test validate_compiled_ground_volume!(raised_volume, :ground) === nothing

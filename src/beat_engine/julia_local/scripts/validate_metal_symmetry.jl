@@ -1,13 +1,20 @@
 using LinearAlgebra
+using StaticArrays
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
+include(joinpath(@__DIR__, "..", "compiled_ground_contract.jl"))
 
 relative_error(actual, reference) = norm(actual - reference) / max(norm(reference), eps(real(eltype(reference))))
 
-function validate_fixture(mesh_name::String, symmetry_mode::Symbol)
+function validate_fixture(mesh_name::String, symmetry_mode::Symbol; ground_lift::Float32=0.0f0)
     mesh_path = joinpath(@__DIR__, "..", "test_meshes", mesh_name)
     mesh = load_gmsh22_with_tags(mesh_path, Float32(0.001))
+    if symmetry_mode == :ground
+        vertices = [SVector{3,Float32}(v[1], v[2] + ground_lift, v[3]) for v in mesh.vertices]
+        mesh = BoundaryMesh(vertices, mesh.faces, mesh.physical_tags)
+        validate_compiled_ground_domain!(mesh, symmetry_mode)
+    end
     mesh = snap_symmetry_planes(mesh, symmetry_mode)
     validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
     p1 = build_p1_space(mesh)
@@ -78,6 +85,7 @@ function validate_fixture(mesh_name::String, symmetry_mode::Symbol)
         println((
             mesh=mesh_name,
             symmetry=symmetry_mode,
+            ground_lift=ground_lift,
             singular_mode=singular_mode,
             faces=length(mesh.faces),
             image_singular_pairs=metal_operators.image_singular_pairs,
@@ -87,6 +95,13 @@ function validate_fixture(mesh_name::String, symmetry_mode::Symbol)
         ))
         flush(stdout)
         maximum(values(operator_errors)) <= 2.0f-6 || error("Metal symmetry operators ($(singular_mode)) differ from BEAT CPU.")
+        if symmetry_mode == :ground
+            if ground_lift > 0
+                metal_operators.image_singular_pairs == 0 || error("Lifted ground fixture has image-singular pairs.")
+            else
+                metal_operators.image_singular_pairs > 0 || error("Resting-edge ground fixture missed image-singular pairs.")
+            end
+        end
         pressure_error <= 5.0f-3 || error("Metal symmetry pressure differs from BEAT CPU.")
         field_error <= 5.0f-3 || error("Metal symmetry field differs from BEAT CPU.")
 
@@ -105,6 +120,12 @@ function validate_metal_symmetry()
     println("device=$(metal.device().name)")
     validate_fixture("sample_half.msh", :x)
     validate_fixture("sample_quarter.msh", :xy)
+    # Optional hardware qualification: lifted geometry and contact edges both
+    # use the existing parity bounds. CPU CI exercises the source contract.
+    if get(ENV, "BLAB_VALIDATE_GROUND", "0") == "1"
+        validate_fixture("sample_half.msh", :ground; ground_lift=0.15f0)
+        validate_fixture("sample_quarter.msh", :ground)
+    end
     println("METAL_SYMMETRY_VALIDATION_OK")
 end
 

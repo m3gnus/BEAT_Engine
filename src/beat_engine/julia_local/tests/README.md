@@ -109,3 +109,23 @@ coupled cache reuse across frequencies, and full-diagnostic fallback. The tests
 preserve complex pressure/flux and independent source columns. Run with the
 CUDA Julia project and a functional device; an unavailable-device skip does not
 qualify this architecture.
+
+Source requests accept `config.symmetry = "ground"` for a rigid image plane at
+Y=0. Mesh coordinates (including `meshes[].translation_m`) must put the whole
+radiator at Y >= 0, with no triangle flat on the plane. Contact vertices and
+edges are allowed. Ground and native mirror modes (`x`, `xy`) are exclusive
+values of the same option. The image contributes to pressure, but counts as
+one physical radiator for impedance. The optional
+`ground_plane_min_clearance_m` must be finite and non-negative and enforces
+clearance of the radiator surface in metres; its default of zero allows contact
+edges. Compiled requests use the same guard and option in solver options.
+Placement and observation-frame mapping remain the caller's responsibility.
+
+`source_ground_contract_tests.jl` runs on CPU in both `runtests.jl` and the
+standalone reference gate. It checks domain refusals, clearance, unchanged
+native mirror counts, and an active ground image without a 6.02 dB impedance
+increase through both source assembly paths. Additional Metal parity cases are
+opt-in: set `BLAB_VALIDATE_GROUND=1` when running
+`scripts/validate_metal_symmetry.jl` with the `julia_metal` project on a functional
+Metal device. They cover lifted `sample_half.msh` and resting-edge
+`sample_quarter.msh` with the existing operator, pressure and field bounds.

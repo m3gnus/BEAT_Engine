@@ -1,6 +1,11 @@
 """Validate the real radiator against the rigid image plane at Y=0."""
-function validate_compiled_ground_domain!(mesh, symmetry_mode; tolerance::Real=1.0e-6)
+function validate_compiled_ground_domain!(
+    mesh, symmetry_mode; min_clearance_m::Real=0.0, tolerance::Real=1.0e-6,
+)
     symmetry_mode == :ground || return nothing
+    isfinite(min_clearance_m) && min_clearance_m >= 0 || error(
+        "ground_plane_min_clearance_m must be finite and non-negative."
+    )
     isempty(mesh.faces) && error("Rigid-ground symmetry requires a mesh with faces.")
 
     minimum_y = minimum(
@@ -16,6 +21,12 @@ function validate_compiled_ground_domain!(mesh, symmetry_mode; tolerance::Real=1
         error(
             "Rigid-ground symmetry cannot image triangle $(face_index), which lies " *
             "flat on Y=0 and would coincide with itself."
+        )
+    end
+    if min_clearance_m > 0 && minimum_y < min_clearance_m
+        error(
+            "Rigid-ground symmetry requires at least $(min_clearance_m) m of " *
+            "clearance, but the mesh reaches Y=$(minimum_y) m."
         )
     end
     return nothing
@@ -39,6 +50,9 @@ exterior_motion_factor(excitation, normal, ::Type{T}) where {T<:AbstractFloat} =
     T(dot(normal, excitation.motion_axis))
 
 """Radiation impedance scales by real symmetry copies, not image sources."""
+physical_radiator_count(symmetry_mode) =
+    symmetry_mode == :ground ? 1 : symmetry_reduction_factor(symmetry_mode)
+
 function exterior_component_impedance(mesh, pressure, excitation, symmetry_mode, ::Type{T}) where {T<:AbstractFloat}
     force = zero(Complex{T})
     amplitude_by_tag = Dict(zip(excitation.tags, excitation.amplitudes))
@@ -51,6 +65,5 @@ function exterior_component_impedance(mesh, pressure, excitation, symmetry_mode,
         force += get(excitation, :motion_axis, nothing) === nothing ? contribution :
             contribution * exterior_motion_factor(excitation, mesh.normals[face_index], T)
     end
-    real_radiator_count = symmetry_mode == :ground ? 1 : symmetry_reduction_factor(symmetry_mode)
-    return force * T(real_radiator_count)
+    return force * T(physical_radiator_count(symmetry_mode))
 end

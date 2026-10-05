@@ -947,7 +947,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
     mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode)
     validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
-    validate_compiled_ground_domain!(mesh, symmetry_mode)
+    validate_compiled_ground_domain!(
+        mesh, symmetry_mode;
+        min_clearance_m=Float64(get(options, "ground_plane_min_clearance_m", 0.0)),
+    )
     excitation_port_ids = String.(request["excitation_port_ids"])
     excitations = exterior_excitations(
         excitation_port_ids,
@@ -2593,6 +2596,7 @@ function solve_request_impl(request; event_mode=false)
     validate_compiled_ground_domain!(
         bem_mesh,
         symmetry_mode;
+        min_clearance_m=Float64(get(solver_options, "ground_plane_min_clearance_m", 0.0)),
         tolerance=symmetry_tolerance,
     )
     combined_interfaces = combined_interface_map_from_wire(
