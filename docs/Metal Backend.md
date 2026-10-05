@@ -607,8 +607,25 @@ CPU-versus-Metal differences exceed their tolerances.
 
 ## Operational behavior
 
-- A cold Julia worker compiles Metal kernels before its first solve. Steady-state
-  solve time should be evaluated after warm-up.
+- Compiled-system workers load `BeatEngineCompiledMetalBundle`, which caches
+  the compiled driver and production Metal kernel signatures in a Julia package
+  image. Metal 1.11.1 with GPUCompiler 2.9.0 stores the device code during
+  `Pkg.precompile()`; this installation cost is paid once, and the workload
+  compiles and links without launching an engine kernel. The precompile log
+  reports the signature count and warns on failures. Host compilation and
+  device pipeline setup still contribute to the first request. Measure worker
+  ready, first request and second request separately; steady-state solve time
+  should be evaluated after warm-up.
+  The enabled compiled Metal entry loads Metal before JSON to match the bundle
+  dependency order and retain its cached worker call graph. Explicit fallback
+  and other backend entry orders are unchanged.
+- The generated kernel inventory is checked against production requests by
+  `metal_kernel_coverage_tests.jl` in Metal hardware qualification. See the
+  [bundle README](../src/beat_engine/julia_engine/BeatEngineCompiledMetalBundle/README.md)
+  for coverage and regeneration. Uncached specializations compile normally.
+  `BLAB_BEAT_ENGINE_BUNDLE=0` retains the include fallback for diagnosis; an
+  unavailable bundle also uses that fallback. CPU, CUDA and ROCm retain their
+  existing behavior.
 - Frequency-independent caches remain resident for the worker's lifetime and are
   released when the worker exits.
 - The default `pair_gather` kernels are bitwise reproducible run to run, as

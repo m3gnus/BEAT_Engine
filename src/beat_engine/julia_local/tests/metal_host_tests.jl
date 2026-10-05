@@ -19,6 +19,8 @@
 using Test
 import Metal
 
+include(joinpath(@__DIR__, "compiled_metal_worker_tests.jl"))
+
 using BeatEngineMetalBundle
 const Engine = BeatEngineMetalBundle.BeatEngineCore
 

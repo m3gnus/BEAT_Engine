@@ -91,9 +91,9 @@ const WORKLOAD_MESH = """
     # everything up to and including the backend branch, it is the same code a
     # GPU solve runs to get there, and it needs no device: precompilation runs
     # in a sandboxed worker on a build machine that may have no accelerator at
-    # all. What a GPU workload would add is its own kernel compilation, and
-    # that cannot be cached to disk in any case -- it is why the worker is kept
-    # alive between solves.
+    # all. This source-entry bundle retains its host-only workload. The
+    # compiled-contract Metal bundle also caches device code with Metal 1.11.1;
+    # see BeatEngineCompiledMetalBundle for its compile-only inventory.
     directory = mktempdir()
     try
         mesh = joinpath(directory, "workload.msh")

@@ -33,3 +33,16 @@ subprocess.run(
     env=environment,
     check=True,
 )
+if backend == "metal":
+    for test in ("metal_host_tests.jl", "metal_kernel_coverage_tests.jl"):
+        subprocess.run(
+            [
+                "julia",
+                "--threads=2",
+                "--startup-file=no",
+                f"--project={paths.project}",
+                str(paths.root / "julia_local/tests" / test),
+            ],
+            env=environment,
+            check=True,
+        )

@@ -1,7 +1,11 @@
 [deps]
+BeatEngineCompiledMetalBundle = "8e1a2b34-6c5d-4f70-8b9a-1c2d3e4f5a67"
 BeatEngineMetalBundle = "046d46cd-a62e-40e9-999a-57ef70256860"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 MUMPS_seq_jll = "d7ed1dd3-d0ae-5e8e-bfb4-87a502085b8d"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 OpenBLAS32_jll = "656ef2d0-ae68-5445-9ca0-591084a874a2"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[compat]
+Metal = "=1.11.1"

@@ -1,4 +1,5 @@
 [deps]
+BeatEngineCompiledCpuBundle = "5c7d6f0a-3b6e-4d0a-9a53-0d9b1f2a7c11"
 BeatEngineCpuBundle = "dbb44b52-9b63-42c8-872c-0d4697051c06"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"

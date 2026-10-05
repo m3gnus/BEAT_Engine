@@ -1,8 +1,6 @@
 # Standalone loader parity gate, including meshio/VTK quadratic ordering.
 using Test, Base64
-solver = normpath(joinpath(@__DIR__, "..", "coupled_solver.jl"))
-source = first(split(read(solver, String), "\nif \"--worker\" in ARGS"))
-include_string(Main, source, solver)
+include(normpath(joinpath(@__DIR__, "..", "BeatEngineCompiledDriver.jl")))
 
 function packed(values, dtype)
     shape = collect(size(values))
