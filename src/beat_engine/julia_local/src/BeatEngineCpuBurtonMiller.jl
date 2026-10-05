@@ -290,7 +290,9 @@ function assemble_burton_miller_neumann_system_cpu(
     singular_cache=nothing,
     cpu_cache=nothing,
     symmetry_mode::Symbol=:off,
+    regular_kernel::Symbol=:scalar,
 ) where {T<:AbstractFloat}
+    regular_kernel = _beat_cpu_validated_regular_kernel(regular_kernel)
     k = outgoing_wavenumber(k)
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
     if cpu_cache !== nothing
@@ -320,7 +322,10 @@ function assemble_burton_miller_neumann_system_cpu(
     end
     image_transforms = cpu_cache === nothing ? collect(symmetry_image_transforms(symmetry_mode)) : cpu_cache.image_transforms
 
-    regular_elapsed = @elapsed begin
+    regular_elapsed = regular_kernel === :simd ? (@elapsed _beat_cpu_bm_regular_simd_pass!(
+        lhs, rhs, q_complex, mesh, elements, regular_quadrature, indices, color_groups,
+        threaded_enabled, image_transforms, cpu_cache, k, coupling,
+    )) : @elapsed begin
         if threaded_enabled
             for group in color_groups
                 Threads.@threads for group_index in eachindex(group)
@@ -454,6 +459,7 @@ function assemble_burton_miller_neumann_system_cpu(
         drive_count=drive_count,
         on_gpu=false,
         assembly_mode=:cpu_fused_burton_miller,
+        regular_kernel=regular_kernel,
     )
 end
 

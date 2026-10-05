@@ -752,7 +752,9 @@ function assemble_regular_galerkin_operators_cpu(
     near_correction_cache=nothing,
     image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
+    regular_kernel::Symbol=:scalar,
 ) where {T<:AbstractFloat}
+    regular_kernel = _beat_cpu_validated_regular_kernel(regular_kernel)
     k = outgoing_wavenumber(k)
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
 
@@ -785,7 +787,11 @@ function assemble_regular_galerkin_operators_cpu(
     timing !== nothing && (timing["regular_operator_cpu_color_build"] = color_build_elapsed)
     image_transforms = cpu_cache === nothing ? collect(symmetry_image_transforms(symmetry_mode)) : cpu_cache.image_transforms
 
-    regular_elapsed = @elapsed begin
+    regular_elapsed = regular_kernel === :simd ? (@elapsed _beat_cpu_accumulate_regular_simd_pass!(
+        single_layer, double_layer, adjoint_double_layer, hypersingular,
+        mesh, elements, regular_quadrature, indices, color_groups,
+        threaded_enabled, image_transforms, cpu_cache, k,
+    )) : @elapsed begin
         if threaded_enabled
             for group in color_groups
                 Threads.@threads for group_index in eachindex(group)

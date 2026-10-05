@@ -817,6 +817,8 @@ function solve_request_impl(request)
     end
     base_regular_order = Int(get_value(config, "quadrature_order", 4))
     regular_quadrature_mode = regular_quadrature_mode_from_config(config, beat_backend)
+    # Selected here, once per request, and handed to the CPU assembly only.
+    cpu_regular_kernel = BeatEngineCore.beat_cpu_regular_kernel()
     rule = triangle_rule(FloatType, base_regular_order)
     cpu_field_cache = build_field_evaluation_cache(mesh, rule; symmetry_mode=Symbol(symmetry_mode))
     singular_order = Int(get_value(config, "singular_order", 4))
@@ -1102,6 +1104,7 @@ function solve_request_impl(request)
                         singular_cache=singular_cache,
                         cpu_cache=selected_cpu_assembly_cache,
                         symmetry_mode=Symbol(symmetry_mode),
+                        regular_kernel=cpu_regular_kernel,
                     )
                 assembly_payload = (kind=:fused, system=fused_system, q_columns=fused_q_columns)
             else
@@ -1124,6 +1127,7 @@ function solve_request_impl(request)
                     rocm_assembly_mode=rocm_assembly_mode,
                     metal_assembly_mode=metal_assembly_mode,
                     symmetry_mode=Symbol(symmetry_mode),
+                    cpu_regular_kernel=cpu_regular_kernel,
                 ))
             end
         end
@@ -1299,6 +1303,7 @@ function solve_request_impl(request)
                     "p1_dof_count" => p1_space.global_dof_count,
                     "regular_quadrature_mode" => regular_quadrature_mode,
                     "regular_quadrature_order" => quadrature_selection.order,
+                    "cpu_regular_kernel" => beat_backend == :cpu ? String(cpu_regular_kernel) : nothing,
                     "regular_quadrature_base_order" => base_regular_order,
                     "regular_quadrature_wavelength_mesh_stat" => quadrature_selection.mesh_stat,
                     "regular_quadrature_wavelength_mesh_area_stat_m2" => quadrature_selection.mesh_area_stat,
