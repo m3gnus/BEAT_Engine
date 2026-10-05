@@ -97,6 +97,14 @@ function workload_request(mesh, symmetry)
     )
 end
 
+function __init__()
+    provenance = BeatEngineContract.BeatEngineProvenance
+    provenance.IDENTITY[] = nothing
+    provenance.RUNTIME[] = nothing
+    RUN_MESH_PROVENANCE[] = Any[]
+    COMPILED_WORKER_LOAD[] = nothing
+end
+
 include(joinpath(@__DIR__, "..", "..", "CompiledExteriorWorkload.jl"))
 
 @compile_workload begin

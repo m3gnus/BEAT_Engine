@@ -148,3 +148,28 @@ and report applied pair count, maximum order and selected image-transform count
 in result diagnostics. The source option rejects CUDA, ROCm and Metal before
 loading geometry or devices. Existing explicit compiled proximity inputs and
 CUDA single-cache entry points retain their contracts.
+
+
+## Compiled-worker dispatch qualification
+
+`validate_compiled_reachability.py --julia <path> --backend <cpu|metal> --out <json>`
+starts real compiled workers and requires their expected bundle in both readiness
+and result diagnostics. It checks independent ports, off/xy symmetry, operator
+parity, explicit source fallback, and Float64 CPU scalar-reference agreement.
+Run every Julia invocation, including this Python-launched gate, through the
+compute broker.
+
+Compiled exterior CPU `direct_system` now reaches the existing fused assembler,
+regular/singular SIMD kernels and transposed scatter, with the existing CPU LU
+solve policy. `operator_matrices` remains an explicit route (regular SIMD,
+scalar operator singular corrections). CPU exterior field evaluation selects
+its SIMD kernel; coupled field calls retain their scalar default. The controls
+`BLAB_BEAT_CPU_{REGULAR,SINGULAR,FIELD}_KERNEL=scalar` retain scalar access. The
+compiled CPU workload exercises the parsed JSON request, rather than Julia Dict
+values that differ from production decoding.
+
+Readiness and results report `compiled_worker` with requested/loaded bundle,
+driver mode and fallback reason. Bundle load errors also warn on stderr. CUDA
+and ROCm report that they have no compiled bundle; `BLAB_BEAT_ENGINE_BUNDLE=0`
+reports the explicit disable. This is reachability evidence, not a startup or
+performance claim.

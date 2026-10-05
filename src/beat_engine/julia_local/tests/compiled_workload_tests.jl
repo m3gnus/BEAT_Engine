@@ -1,8 +1,16 @@
 using Test
-import BeatEngineCompiledCpuBundle
+# Hardware suites use the Metal project, whose compiled bundle also contains
+# the CPU host workload. Do not require an undeclared CPU package there.
+if basename(dirname(Base.active_project())) == "julia_metal"
+    import BeatEngineCompiledMetalBundle
+    const CompiledWorkloadBundle = BeatEngineCompiledMetalBundle
+else
+    import BeatEngineCompiledCpuBundle
+    const CompiledWorkloadBundle = BeatEngineCompiledCpuBundle
+end
 
 @testset "compiled exterior workload covers production requests" begin
-    bundle = BeatEngineCompiledCpuBundle
+    bundle = CompiledWorkloadBundle
     core = bundle.BeatEngineCore
     mktempdir() do directory
         path = joinpath(directory, "plate.msh")
@@ -26,8 +34,24 @@ import BeatEngineCompiledCpuBundle
         @test length(outputs["diagonal"]["options"]["points_m"]) == 37
         @test outputs["surface:p"]["quantity"] == "bem_boundary_pressure"
         @test outputs["surface:q"]["quantity"] == "bem_boundary_neumann"
-        outcome = redirect_stdout(devnull) do
-            bundle.solve_request(request; event_mode=true)
+        # Capture the real JSON-decoded driver result, including effective dispatch.
+        result_path = joinpath(directory, "events.jsonl")
+        outcome = open(result_path, "w") do io
+            redirect_stdout(io) do
+                bundle.solve_request(request; event_mode=true)
+            end
+        end
+        events = bundle.JSON.parse.(readlines(result_path))
+        results = [event["result"] for event in events if event["type"] == "result"]
+        @test length(results) == 2
+        for result in results
+            diagnostics = result["diagnostics"]
+            @test diagnostics["burton_miller_assembly"] == "direct_system"
+            @test diagnostics["cpu_regular_kernel"] == "simd"
+            @test diagnostics["cpu_singular_kernel"] == "simd"
+            @test diagnostics["cpu_field_kernel"] == "simd"
+            @test diagnostics["linear_solver"] == "cpu_dense_lu"
+            @test diagnostics["factorization_count"] == 1
         end
         @test !outcome.cancelled
         @test outcome.solved_count == 2

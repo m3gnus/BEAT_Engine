@@ -24,6 +24,10 @@ end
 function precompile_metal_kernel_signatures()
     # Metal.functional() is false while generating a package image, even on a
     # GPU host. Follow Metal's platform gate; device failures warn below.
+    if VERSION < v"1.11"
+        @info "BEAT Metal kernel workload skipped: requires Julia 1.11 or newer"
+        return
+    end
     if !(Sys.isapple() && Sys.ARCH === :aarch64)
         @info "BEAT Metal kernel workload skipped: requires Apple Silicon"
         return

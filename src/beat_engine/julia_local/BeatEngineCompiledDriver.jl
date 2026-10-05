@@ -24,10 +24,12 @@ using .BeatEngineInterfaceRadiation
 
 const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
 const RUN_MESH_PROVENANCE = Ref{Any}([])
+const COMPILED_WORKER_LOAD = Ref{Any}(nothing)
 
 function record_result_provenance!(result, request)
     diagnostics = result["diagnostics"]
     diagnostics["phasor_convention"] = phasor_convention()
+    diagnostics["compiled_worker"] = COMPILED_WORKER_LOAD[]
     backend = get(diagnostics, "bem_backend", get(diagnostics, "linear_backend", nothing))
     device, device_error = try
         accelerator = backend == "cuda" ? BeatEngineCore.CUDA_MODULE : backend == "rocm" ? BeatEngineCore.AMDGPU_MODULE :
@@ -813,7 +815,7 @@ function exterior_neumann(mesh, excitation, density::T, omega::T) where {T<:Abst
     return values
 end
 
-function exterior_field(points, mesh, pressure, neumann, wavenumber, cache, backend)
+function exterior_field(points, mesh, pressure, neumann, wavenumber, cache, backend; cpu_kernel=:scalar)
     if backend == :cuda
         return evaluate_galerkin_field_cuda(points, mesh, pressure, neumann, wavenumber, cache)
     elseif backend == :rocm
@@ -821,7 +823,8 @@ function exterior_field(points, mesh, pressure, neumann, wavenumber, cache, back
     elseif backend == :metal
         return evaluate_galerkin_field_metal(points, mesh, pressure, neumann, wavenumber, cache)
     end
-    return evaluate_galerkin_field_cpu(points, mesh, pressure, neumann, wavenumber, cache)
+    return evaluate_galerkin_field_cpu(points, mesh, pressure, neumann, wavenumber, cache;
+        kernel=cpu_kernel)
 end
 
 function solve_exterior_direct_cuda(
@@ -918,6 +921,8 @@ function solve_exterior_direct_metal(
     end
 end
 
+release_exterior_metal_system(produced) = release_metal_burton_miller_system!(produced.system)
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -933,6 +938,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     requested_assembly in ("direct_system", "operator_matrices") || error(
         "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
     )
+    direct_cpu_assembly = backend == :cpu && requested_assembly == "direct_system"
+    cpu_regular_kernel = backend == :cpu ? BeatEngineCore.beat_cpu_regular_kernel() : :scalar
+    cpu_singular_kernel = direct_cpu_assembly ? BeatEngineCore.beat_cpu_singular_kernel() : :scalar
     direct_cuda_assembly = backend == :cuda && requested_assembly == "direct_system"
     # Metal's direct assembler is the fused Burton-Miller path: A and every
     # excitation's b are formed on the GPU without the four operators, and the
@@ -941,7 +949,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     # four-operator path, and the effective mode is reported either way.
     direct_metal_assembly = backend == :metal && requested_assembly == "direct_system" &&
         metal_direct_assembly_available()
-    assembly_mode = direct_cuda_assembly || direct_metal_assembly ? "direct_system" : "operator_matrices"
+    assembly_mode = direct_cpu_assembly || direct_cuda_assembly || direct_metal_assembly ? "direct_system" : "operator_matrices"
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(get(options, "symmetry", "off"))
     sound_speed = FloatType(unbounded_region["sound_speed_m_per_s"])
     density = FloatType(unbounded_region["density_kg_per_m3"])
@@ -1084,7 +1092,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         )
         return (system=system, k=wavenumber, assembly_s=assembly_s)
     end
-    release_produced_system = produced -> release_metal_burton_miller_system!(produced.system)
+    release_produced_system = release_exterior_metal_system
     assembly_pipeline = nothing
     assembly_lookahead = 0
     # The pipelined system being solved, freed by the `finally` if the solve throws.
@@ -1149,7 +1157,22 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             operators = nothing
             metal_solve_method = :lu
             dense_solve_report = nothing
-            if direct_cuda_assembly
+            if direct_cpu_assembly
+                assembly_started = time_ns()
+                cpu_direct_system = assemble_burton_miller_neumann_system_cpu(
+                    mesh, p1_space, dp0_space, reduce(hcat, neumann_values), wavenumber, rule;
+                    identity_p1_p1=selected_identity[1], identity_p1_dp0=selected_identity[2],
+                    singular_order=singular_order, singular_cache=singular_cache,
+                    cpu_cache=selected_cpu_cache, symmetry_mode=symmetry_mode,
+                    regular_kernel=cpu_regular_kernel, singular_kernel=cpu_singular_kernel,
+                )
+                assembly_s = (time_ns() - assembly_started) / 1.0e9
+                solve_started = time_ns()
+                pressure, dense_solve_report = solve_burton_miller_neumann_system_cpu_with_report(cpu_direct_system; method=:lu)
+                pressures = [copy(column) for column in eachcol(pressure)]
+                metal_solve_method = dense_solve_report.method
+                solve_s = (time_ns() - solve_started) / 1.0e9
+            elseif direct_cuda_assembly
                 pressures, assembly_s, solve_s = solve_exterior_direct_cuda(
                     mesh, p1_space, dp0_space, neumann_values, wavenumber, rule;
                     device_cache=device_cache,
@@ -1194,6 +1217,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     accelerator_quadrature=accelerator_backend,
                     singular_cache=singular_cache,
                     cpu_cache=selected_cpu_cache,
+                    cpu_regular_kernel=cpu_regular_kernel,
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
                     symmetry_mode=symmetry_mode,
@@ -1239,7 +1263,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                             neumann,
                             wavenumber,
                             selected_field_cache,
-                            backend,
+                            backend;
+                            cpu_kernel=backend == :cpu ? BeatEngineCore.beat_cpu_field_kernel() : :scalar,
                         ) for (pressure, neumann) in zip(pressures, neumann_values)
                     ]
                     push!(
@@ -1313,10 +1338,19 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "symmetry" => String(symmetry_mode),
                 "formulation" => "exterior_burton_miller_neumann",
                 "burton_miller_assembly" => assembly_mode,
+                "cpu_regular_kernel" => backend == :cpu ? String(cpu_regular_kernel) : nothing,
+                "cpu_singular_kernel" => backend == :cpu ? String(cpu_singular_kernel) : nothing,
+                "cpu_field_kernel" => backend == :cpu ? String(BeatEngineCore.beat_cpu_field_kernel()) : nothing,
+                "metal_regular_kernel" => backend == :metal ?
+                    (direct_metal_assembly ? "packed_fused" : String(BeatEngineCore._normalized_metal_regular_kernel_mode())) : nothing,
+                "metal_singular_kernel" => backend == :metal ?
+                    (direct_metal_assembly ? "packed_grouped_duffy" : String(BeatEngineCore._normalized_metal_singular_mode())) : nothing,
+                "metal_field_kernel" => backend == :metal ?
+                    (FloatType === Float32 ? "packed_float32" : "generic") : nothing,
                 "factorization_count" => metal_solve_method == :gmres ? 0 :
                                          direct_cuda_assembly || backend in (:cpu, :metal) ? 1 : length(excitations),
                 "linear_solver" => backend == :cpu ?
-                                   "cpu_dense_lu" :
+                                   "cpu_dense_" * String(metal_solve_method) :
                                    backend == :cuda ? "cuda_dense_lu" :
                                    backend == :metal ? "metal_assembly_cpu_dense_" * String(metal_solve_method) :
                                    "rocm_rocsolver_dense_lu",
@@ -3888,6 +3922,7 @@ end
 
 function run_worker()
     ready = worker_ready(worker_backend_availability())
+    ready["compiled_worker"] = COMPILED_WORKER_LOAD[]
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
     push!(ready["operations"], "reclaim")
     println(JSON.json(ready))

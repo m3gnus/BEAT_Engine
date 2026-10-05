@@ -42,7 +42,9 @@ end
         output = read(pipeline(command; stdin=devnull), String)
         ready = JSON.parse(first(split(output, '\n')))
         @test ready["type"] == "ready"
-        @test ready["contracts"]["compiled_system"] == [1]
+        @test ready["compiled_worker"]["loaded_bundle"] == "BeatEngineCompiledMetalBundle"
+        @test ready["compiled_worker"]["fallback_reason"] === nothing
+        @test ready["contracts"]["compiled_system"] == [1, 2]
         @test ready["runtime"]["julia_threads"] == 2
         @test ready["runtime"]["project_file"] == Base.active_project()
     end

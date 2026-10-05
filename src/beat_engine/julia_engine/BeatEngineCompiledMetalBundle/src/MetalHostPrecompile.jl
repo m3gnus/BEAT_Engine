@@ -54,8 +54,7 @@ function metal_host_signatures()
     add(core._metal_build_singular_gather_map, (Vector{Int32}, Vector{Int32}, Nothing))
     add(core._launch_metal_fused_pair_kernels!,
         (shared(ComplexF32, 2), private(ComplexF32, 3), private(ComplexF32, 2),
-         regular, Float32, private(Int32, 1), private(Int32, 1), Int32,
-         ntuple(_ -> Float32, 6)...))
+         regular, Float32, Vector{Any}, private(Float32, 1), Dict{String,Float64}))
     for args in ((shared(ComplexF32, 2), shared(ComplexF32, 2), private(ComplexF32, 2),
                   regular, singular, Float32),
                  (shared(ComplexF32, 2), shared(ComplexF32, 2), private(ComplexF32, 2),
@@ -107,11 +106,12 @@ function metal_host_signatures()
         core._metal_singular_rhs_gather_kernel!, core._metal_sparse_scatter_kernel!))
     launches = Set((core._metal_fused_pair_blocks_kernel!,
         core._metal_fused_lhs_gather_kernel!, core._metal_fused_rhs_gather_kernel!,
-        core._metal_fused_rhs_reduce_kernel!, core._metal_singular_fused_bm_blocks_kernel!,
+        core._metal_fused_rhs_reduce_kernel!, core._metal_fused_singular_packed_kernel!,
         core._metal_singular_entry_gather_kernel!, core._metal_singular_rhs_gather_kernel!,
         core._metal_sparse_scatter_kernel!, core._metal_weighted_field_sources_kernel!,
         core._metal_field_eval_entries_kernel!, core._metal_field_eval_chunked_kernel!,
-        core._metal_field_reduce_partials_kernel!))
+        core._metal_field_reduce_partials_kernel!, core._metal_fast_field_kernel!,
+        core._metal_fast_field_sources_kernel!, core._metal_fast_field_reduce_kernel!))
     for (f, tt) in metal_kernel_signatures()
         f in launches || continue
         # fieldtypes expands fixed Vararg entries in the generated inventory.

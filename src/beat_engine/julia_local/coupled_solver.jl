@@ -39,13 +39,16 @@ end
 
 using JSON
 
+const BEAT_COMPILED_BUNDLE_ERROR = Ref{Union{Nothing,String}}(nothing)
 const BEAT_COMPILED_BUNDLE = if get(ENV, "BLAB_BEAT_ENGINE_BUNDLE", "1") == "0" || BEAT_COMPILED_BUNDLE_NAME === nothing
     nothing
 else
     try
         @eval using $BEAT_COMPILED_BUNDLE_NAME
         @eval $BEAT_COMPILED_BUNDLE_NAME
-    catch
+    catch exception
+        BEAT_COMPILED_BUNDLE_ERROR[] = sprint(showerror, exception)
+        @warn "BEAT compiled bundle load failed; using source driver" bundle=BEAT_COMPILED_BUNDLE_NAME exception
         nothing
     end
 end
@@ -55,6 +58,14 @@ if BEAT_COMPILED_BUNDLE === nothing
 end
 
 const DRIVER = BEAT_COMPILED_BUNDLE === nothing ? Main : BEAT_COMPILED_BUNDLE
+DRIVER.COMPILED_WORKER_LOAD[] = Dict(
+    "requested_bundle" => BEAT_COMPILED_BUNDLE_NAME === nothing ? nothing : String(BEAT_COMPILED_BUNDLE_NAME),
+    "loaded_bundle" => BEAT_COMPILED_BUNDLE === nothing ? nothing : String(nameof(BEAT_COMPILED_BUNDLE)),
+    "driver_mode" => BEAT_COMPILED_BUNDLE === nothing ? "source" : "bundle",
+    "fallback_reason" => BEAT_COMPILED_BUNDLE !== nothing ? nothing :
+        get(ENV, "BLAB_BEAT_ENGINE_BUNDLE", "1") == "0" ? "disabled_by_environment" :
+        BEAT_COMPILED_BUNDLE_NAME === nothing ? "backend_has_no_compiled_bundle" : BEAT_COMPILED_BUNDLE_ERROR[],
+)
 
 if "--worker" in ARGS
     try

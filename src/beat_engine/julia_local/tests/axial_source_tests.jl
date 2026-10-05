@@ -2,9 +2,7 @@
 # Like memory_mesh_tests.jl, omit only the CLI entrypoint when loading it.
 module AxialSourceTests
 using Test, StaticArrays, LinearAlgebra, Base64
-solver = normpath(joinpath(@__DIR__, "..", "coupled_solver.jl"))
-source = first(split(read(solver, String), "\nif \"--worker\" in ARGS"))
-include_string(@__MODULE__, source, solver)
+include(joinpath(@__DIR__, "..", "BeatEngineCompiledDriver.jl"))
 
 function write_surface(path, mesh)
     open(path, "w") do io
@@ -46,7 +44,7 @@ function compiled_result(path, mesh, axis, points, frequency, convention, backen
     result = solve_compiled_result(request)
     @test result["diagnostics"]["bem_backend"] == String(backend)
     @test result["diagnostics"]["burton_miller_assembly"] ==
-          (backend == :cpu ? "operator_matrices" : "direct_system")
+          "direct_system"
     return decoded_quantities(result)
 end
 
@@ -255,7 +253,7 @@ function component_force_checks(path, backend)
             @test result["excitation_port_ids"] == request["excitation_port_ids"]
             @test result["diagnostics"]["bem_backend"] == String(backend)
             @test result["diagnostics"]["burton_miller_assembly"] ==
-                  (backend == :cpu ? "operator_matrices" : "direct_system")
+                  "direct_system"
             quantities = decoded_quantities(result)
             pressure = quantities["bem_boundary_pressure"]
             neumann = quantities["bem_boundary_neumann"]
