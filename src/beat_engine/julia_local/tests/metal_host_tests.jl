@@ -51,6 +51,7 @@ end
         :assemble_burton_miller_neumann_system_metal,
         :release_metal_burton_miller_system!,
         :metal_host_operators,
+        :evaluate_galerkin_field_metal_multi,
     )
         @test isdefined(Engine, name)
     end
@@ -138,4 +139,22 @@ end
     @test Engine._normalized_metal_singular_writeback("gather") === :gather
     @test Engine._normalized_metal_singular_writeback("scatter") === :scatter
     @test_throws ErrorException Engine._normalized_metal_singular_writeback("atomic")
+end
+
+@testset "metal multi-drive input validation without a device" begin
+    for T in (Float32, Float64)
+        mesh = Engine.load_gmsh22_with_tags(joinpath(@__DIR__, "..", "test_meshes", "two_tetrahedra.msh"), one(T))
+        # Validation and the empty-point fallback must not dereference device data.
+        cache = Engine.MetalFieldEvaluationCache{T}(nothing, nothing, nothing, nothing, nothing, nothing, 0)
+        pressure = zeros(Complex{T}, length(mesh.vertices))
+        neumann = zeros(Complex{T}, length(mesh.faces))
+        for points in ([], [(one(T), zero(T), one(T))]), nd in (1, 2)
+            pressures, neumanns = fill(pressure, nd), fill(neumann, nd)
+            @test_throws DimensionMismatch Engine.evaluate_galerkin_field_metal_multi(points, mesh, pressures, neumanns[1:end-1], one(T), cache)
+            @test_throws DimensionMismatch Engine.evaluate_galerkin_field_metal_multi(points, mesh, [pressure[1:end-1]], [neumann], one(T), cache)
+            @test_throws DimensionMismatch Engine.evaluate_galerkin_field_metal_multi(points, mesh, [pressure], [neumann[1:end-1]], one(T), cache)
+        end
+        @test isempty(Engine.evaluate_galerkin_field_metal_multi([], mesh, [], [], one(T), cache))
+        @test length(Engine.evaluate_galerkin_field_metal_multi([], mesh, fill(pressure, 9), fill(neumann, 9), one(T), cache)) == 9
+    end
 end

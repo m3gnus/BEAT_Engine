@@ -1462,8 +1462,8 @@ release_operator_storage!(operators) = nothing
 #     events to requested frequencies positionally and rejects a mismatch, and
 #     the user-visible progress count must not jump around. `take_sweep_assembly!`
 #     asserts the invariant rather than assuming it.
-#   * Assembly stays serialized. The accelerator assembly caches carry shared
-#     per-device scratch (the Metal fused path reuses one pair-block buffer), so
+#   * Assembly stays serialized. Some accelerator assembly caches carry shared
+#     per-device scratch (the Metal fused path owns scratch per assembly), so
 #     two concurrent assemblies would race on it, and the Metal `pair_gather`
 #     kernel's run-to-run bit reproducibility depends on one assembly owning
 #     that scratch at a time. One producer keeps both.

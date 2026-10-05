@@ -161,6 +161,53 @@ identity block directly instead of promoting it to a full complex copy. Between
 them these were 0.84-1.16 s of a 6.3-6.7 s solve at 10,230 dofs, and about
 2.5 GB of allocation per frequency.
 
+The fused exterior kernels pack quadrature positions, normals and curls into
+`float4` loads. Trial quadrature is unrolled from a compile-time rule tuple;
+the test loop remains a runtime loop. Each symmetry image accumulates into the
+same pair block before one gather per chunk. Singular pairs pack the full
+Duffy rule coordinates and triangle vertices, group pairs by rule length, and
+specialize point and part counts. Every frequency uses the full singular rule.
+These kernels and the packed Float32 field kernel originate in PR #15, commits
+`7c8491a` and `7e4a39e`, with packed helpers from `09388b9`.
+
+Pair blocks, singular values, field weights and reduction partials belong to
+each assembly or field call. Geometry tables are read-only after locked lazy
+initialization, and caches are released after their callers finish. The packed
+field API evaluates up to eight drives per geometry pass and validates both the
+drive counts and the pressure/Neumann vector lengths before dispatch.
+
+Measured on 2026-10-01 against `e6b3037` on an Apple M1 Max (32 GPU cores, 64 GB), Julia
+1.12.6, pinned Metal 1.10.3 / GPUCompiler 2.5.0, OpenBLAS, 10 Julia threads and
+9 solve BLAS threads: three interleaved fresh-worker pairs, taking the second
+warm 24-frequency sweep. S is the 963-node quarter-symmetric horn, tag 2,
+200-1051.357 Hz; C is the 3,719-node `speaker2-lf.msh`, tag 101, 200-2106 Hz.
+Both use `xy` symmetry, order 4 regular/singular quadrature and the compiled
+exterior entry. The unchanged cost model selected the pipeline for both.
+
+| Case, automatic pipeline | Base sweep seconds, median [range] | Packed sweep seconds, median [range] | Paired base/packed ratio, median [range] |
+|---|---:|---:|---:|
+| S | 2.045 [1.884-2.255] | 1.952 [1.821-2.197] | 0.965 [0.931-1.238] |
+| C | 19.183 [19.179-20.504] | 13.497 [13.356-14.071] | 1.436 [1.421-1.457] |
+
+S has no established wall-time gain within the observed spread; the full
+PR #15's reported 2.1x S gain does not carry over to this scoped port. C improves
+consistently across the pairs. Median section times per frequency are assembly,
+solve and field: S 65.09/49.76/18.66 ms to 59.26/57.60/17.86 ms; C
+714.74/506.94/246.63 ms to 409.00/497.81/27.56 ms. These timers include
+synchronization waits and overlap, so their sum is not elapsed sweep time.
+S uses LU; C uses the unchanged adaptive LU/GMRES route. Median peak physical
+footprint is S 1,937 to 1,920 MiB, C 3,303 to 3,352 MiB.
+
+The 37-point arc pressure and radiation impedance preserve all on-axis SPL and
+impedance-magnitude peak/dip indices. Maximum relative L2 / absolute dB
+differences are S pressure 5.79e-7 / 0.0000217 dB and impedance
+6.11e-7 / 0.00000518 dB, with a bit-identical base A/A comparison. C pressure
+is 6.67e-5 / 0.000880 dB and impedance 5.36e-5 / 0.000447 dB, both worst at
+369.616 Hz, against base A/A noise of 6.64e-5 / 0.000855 dB and
+5.34e-5 / 0.000446 dB respectively. C is near this run's noise floor; the full
+PR's 1e-3 / 0.0096 dB difference is absent. This comparison excludes both the
+singular split and the global BLAS swap and does not isolate either cause.
+
 Four regular-assembly kernel modes exist. The default, `pair_gather`, is
 the chunked pair-gather design described above. It exists because the
 fused atomic kernel was bound by atomic throughput, not arithmetic: each
@@ -584,9 +631,10 @@ CPU-versus-Metal validation scripts:
 
 | Script | Coverage |
 |---|---|
-| `validate_metal_fused_burton_miller.jl` | Fused exterior system against the four-operator system, multi-drive. `BLAB_VALIDATE_SYMMETRY` is a comma-separated arm list; the default runs `off,x,ground` and fails if any arm fails. |
+| `validate_metal_fused_burton_miller.jl` | Fused exterior system against the four-operator system, multi-drive. `BLAB_VALIDATE_SYMMETRY` is a comma-separated arm list; the default runs `off,x,xy,ground` and fails if any arm fails. |
 | `validate_metal_singular_summation.jl` | The fused singular pair against the four-operator accumulation order, per pair, in Float32 against a Float64 reference: the two orders must agree in Float64, neither Float32 order may exceed the stated bound, and the fused order must not be systematically worse. |
 | `validate_gmres_burton_miller.jl` | GMRES against the dense LU on a real assembled operator across the frequency band: true residual, three-way agreement between Krylov variants, restart independence, and that the failure mode the remedies cover is reachable. |
+| `validate_metal_packed_exterior.jl` | Concurrent assemblies sharing geometry caches, multi-drive field parity through the eight-drive batch boundary, and input length validation. |
 | `validate_metal_exterior.jl` | Operators (both singular modes), boundary pressure, residual, and exterior field for an exterior solve. |
 | `validate_metal_symmetry.jl` | X and XY reduced-domain assembly and solve parity, both singular modes. |
 | `validate_metal_coupled.jl` | Coupled FEM-BEM-LEM assembly, condensation, solution, and field for the monolithic and condensed paths, prescribed-velocity and voltage excitations. |

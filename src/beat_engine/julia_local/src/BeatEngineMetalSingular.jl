@@ -82,6 +82,7 @@ function release_metal_singular_correction_cache!(cache::MetalSingularCorrection
     Metal.unsafe_free!(cache.rule_test_points)
     Metal.unsafe_free!(cache.rule_trial_points)
     Metal.unsafe_free!(cache.rule_weights)
+    _release_metal_fused_singular_tables!(cache)
     tables = cache.gather_tables[]
     tables isa MetalSingularGatherTables && _metal_release_singular_gather_tables!(tables)
     cache.gather_tables[] = nothing
