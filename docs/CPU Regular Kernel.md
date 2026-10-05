@@ -80,3 +80,46 @@ julia -t auto --startup-file=no --project=src/beat_engine/julia_local \
 prints the regular-stage time under both kernels, their entrywise difference,
 and the widest floating-point vector LLVM emitted for the loop. It has been
 measured on x86-64 with AVX2 only.
+
+## Field evaluation and singular corrections
+
+Two further CPU stages use the same design, each with its own switch, and
+the same rule: library functions default to scalar and only the CPU
+source-request driver opts in.
+
+| variable | default | stage |
+|---|---|---|
+| `BLAB_BEAT_CPU_FIELD_KERNEL` | `simd` | `evaluate_galerkin_field_cpu(...; kernel=:scalar)` |
+| `BLAB_BEAT_CPU_SINGULAR_KERNEL` | `simd` | `assemble_burton_miller_neumann_system_cpu(...; singular_kernel=:scalar)` |
+
+**Field evaluation.** The scalar loop recomputed, for every observation point
+and every source quadrature point, the source's pressure density
+(`basis . p[face] * weight`) and Neumann density (`q[element] * weight`).
+Neither depends on the observation point. They are now formed once per call
+into contiguous arrays with the source coordinates and normals, and the sum
+over sources is a plain `@simd` reduction with the same polynomial `sincos`
+and zero-radius mask as the regular kernel. The compiled-system field paths
+in `coupled_solver.jl` keep the scalar loop.
+
+**Singular corrections (fused Burton-Miller).** Each touching pair is
+integrated with a Duffy rule of 32 to 1,536 point pairs. A rule stored as
+contiguous coordinate arrays (`BeatCpuDuffyRuleSoA`) dispatches
+`_beat_cpu_bm_pair_blocks` to a vectorised method: basis values and global
+points are formed inline (both are affine in the reference coordinates) and
+the loop over the rule is one `@simd` reduction into 26 real accumulators.
+The singular drivers are unchanged; the assembly converts the rules when
+asked. The four-operator singular path stays scalar.
+
+Both sums have thousands of terms, so in Float32 a changed summation order
+moves a result by more than the regular pass does. Their Float32 gates are
+therefore against Float64: the vectorised Float32 result must be no further
+from the Float64 result than the scalar Float32 result is. In Float64 they are
+gated directly at `1e-13` of the largest entry. Measured, the vectorised
+singular pass is slightly closer to Float64 than the scalar one.
+
+**Scatter.** With the regular kernel vectorised, writing its blocks into the
+dense matrix was about half of the pass at quadrature order 2: a test
+element's rows are strided in column-major storage. The pass drivers now
+transpose the square operators in place, the kernels write the transpose
+(three columns, in trial-dof order), and the drivers transpose back. The
+transpose is an involution, so whatever the matrix held before is preserved.

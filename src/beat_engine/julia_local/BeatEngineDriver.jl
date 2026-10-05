@@ -534,7 +534,9 @@ function field_for_points(points, mesh, pressure, q_neumann, k, field_cache, bea
     elseif beat_backend == :metal
         return evaluate_galerkin_field_metal(points, mesh, pressure, q_neumann, k, field_cache)
     elseif beat_backend == :cpu
-        return evaluate_galerkin_field_cpu(points, mesh, pressure, q_neumann, k, field_cache)
+        return evaluate_galerkin_field_cpu(
+            points, mesh, pressure, q_neumann, k, field_cache; kernel=BeatEngineCore.beat_cpu_field_kernel(),
+        )
     end
     error("Unsupported BEAT Engine backend: $(beat_backend).")
 end
@@ -1105,6 +1107,7 @@ function solve_request_impl(request)
                         cpu_cache=selected_cpu_assembly_cache,
                         symmetry_mode=Symbol(symmetry_mode),
                         regular_kernel=cpu_regular_kernel,
+                        singular_kernel=BeatEngineCore.beat_cpu_singular_kernel(),
                     )
                 assembly_payload = (kind=:fused, system=fused_system, q_columns=fused_q_columns)
             else
@@ -1304,6 +1307,9 @@ function solve_request_impl(request)
                     "regular_quadrature_mode" => regular_quadrature_mode,
                     "regular_quadrature_order" => quadrature_selection.order,
                     "cpu_regular_kernel" => beat_backend == :cpu ? String(cpu_regular_kernel) : nothing,
+                    "cpu_singular_kernel" => assembly_payload.kind === :fused && beat_backend == :cpu ?
+                        String(assembly_payload.system.singular_kernel) : nothing,
+                    "cpu_field_kernel" => beat_backend == :cpu ? String(BeatEngineCore.beat_cpu_field_kernel()) : nothing,
                     "regular_quadrature_base_order" => base_regular_order,
                     "regular_quadrature_wavelength_mesh_stat" => quadrature_selection.mesh_stat,
                     "regular_quadrature_wavelength_mesh_area_stat_m2" => quadrature_selection.mesh_area_stat,

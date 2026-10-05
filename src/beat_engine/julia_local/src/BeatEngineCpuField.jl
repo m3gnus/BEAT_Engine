@@ -4,9 +4,12 @@ function evaluate_galerkin_field_cpu(
     pressure,
     q_neumann,
     k::T,
-    cache::FieldEvaluationCache{T},
+    cache::FieldEvaluationCache{T};
+    kernel::Symbol=:scalar,
 ) where {T<:AbstractFloat}
     k = outgoing_wavenumber(k)
+    kernel === :simd && return _beat_cpu_field_simd(eval_points, pressure, q_neumann, k, cache)
+    kernel === :scalar || error("CPU field kernel must be :simd or :scalar; got $(repr(kernel)).")
     point_count = length(eval_points)
     point_count == 0 && return Complex{T}[]
 

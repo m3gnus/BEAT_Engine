@@ -291,8 +291,10 @@ function assemble_burton_miller_neumann_system_cpu(
     cpu_cache=nothing,
     symmetry_mode::Symbol=:off,
     regular_kernel::Symbol=:scalar,
+    singular_kernel::Symbol=:scalar,
 ) where {T<:AbstractFloat}
     regular_kernel = _beat_cpu_validated_regular_kernel(regular_kernel)
+    singular_kernel = _beat_cpu_validated_regular_kernel(singular_kernel)
     k = outgoing_wavenumber(k)
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
     if cpu_cache !== nothing
@@ -374,13 +376,14 @@ function assemble_burton_miller_neumann_system_cpu(
     singular_pairs = 0
     if !skip_singular
         cache = singular_cache === nothing ? build_singular_correction_cache(mesh, singular_order, indices) : singular_cache
+        singular_rules = singular_kernel === :simd ? _beat_cpu_duffy_rule_soas(cache.rules) : cache.rules
         singular_elapsed = @elapsed begin
             if threaded_enabled
                 for group in color_groups
                     Threads.@threads for group_index in eachindex(group)
                         _beat_cpu_bm_singular_test!(
                             lhs, rhs, q_complex, elements,
-                            cache.pairs_by_test[group[group_index]], cache.rules, k, coupling,
+                            cache.pairs_by_test[group[group_index]], singular_rules, k, coupling,
                         )
                     end
                 end
@@ -388,7 +391,7 @@ function assemble_burton_miller_neumann_system_cpu(
                 for test_index in indices
                     _beat_cpu_bm_singular_test!(
                         lhs, rhs, q_complex, elements,
-                        cache.pairs_by_test[test_index], cache.rules, k, coupling,
+                        cache.pairs_by_test[test_index], singular_rules, k, coupling,
                     )
                 end
             end
@@ -406,6 +409,7 @@ function assemble_burton_miller_neumann_system_cpu(
                     cpu_cache.image_singular_caches[transform_index]
                 image_singular_pairs += image_cache.pair_count
                 image_cache.pair_count == 0 && continue
+                image_rules = singular_kernel === :simd ? _beat_cpu_duffy_rule_soas(image_cache.rules) : image_cache.rules
                 image_elements = cpu_cache === nothing ?
                     _beat_cpu_reflect_element_data(elements, transform) :
                     cpu_cache.image_elements[transform_index]
@@ -417,7 +421,7 @@ function assemble_burton_miller_neumann_system_cpu(
                         Threads.@threads for group_index in eachindex(group)
                             _beat_cpu_bm_image_singular_delta_test!(
                                 lhs, rhs, q_complex, elements, image_elements,
-                                image_cache.pairs_by_test[group[group_index]], image_cache.rules,
+                                image_cache.pairs_by_test[group[group_index]], image_rules,
                                 k, regular_quadrature, image_quadrature, coupling,
                             )
                         end
@@ -426,7 +430,7 @@ function assemble_burton_miller_neumann_system_cpu(
                     for test_index in indices
                         _beat_cpu_bm_image_singular_delta_test!(
                             lhs, rhs, q_complex, elements, image_elements,
-                            image_cache.pairs_by_test[test_index], image_cache.rules,
+                            image_cache.pairs_by_test[test_index], image_rules,
                             k, regular_quadrature, image_quadrature, coupling,
                         )
                     end
@@ -460,6 +464,7 @@ function assemble_burton_miller_neumann_system_cpu(
         on_gpu=false,
         assembly_mode=:cpu_fused_burton_miller,
         regular_kernel=regular_kernel,
+        singular_kernel=singular_kernel,
     )
 end
 
