@@ -82,6 +82,56 @@ const WORKLOAD_MESH = """
 \$EndElements
 """
 
+#: A 3x3 plate in the positive x/y quadrant, every face tagged as
+#: the source. It is what the second workload request below solves with the
+#: `xy` symmetry, so the symmetry-image, image-singular and non-adjacent regular
+#: paths are compiled too; the tetrahedron above has none of the three.
+const WORKLOAD_QUADRANT_MESH = """
+\$MeshFormat
+2.2 0 8
+\$EndMeshFormat
+\$Nodes
+16
+1 0.000 0.000 0.100
+2 0.013 0.000 0.100
+3 0.026 0.000 0.100
+4 0.039 0.000 0.100
+5 0.000 0.013 0.100
+6 0.013 0.013 0.100
+7 0.026 0.013 0.100
+8 0.039 0.013 0.100
+9 0.000 0.026 0.100
+10 0.013 0.026 0.100
+11 0.026 0.026 0.100
+12 0.039 0.026 0.100
+13 0.000 0.039 0.100
+14 0.013 0.039 0.100
+15 0.026 0.039 0.100
+16 0.039 0.039 0.100
+\$EndNodes
+\$Elements
+18
+1 2 2 2 2 1 2 6
+2 2 2 2 2 1 6 5
+3 2 2 2 2 2 3 7
+4 2 2 2 2 2 7 6
+5 2 2 2 2 3 4 8
+6 2 2 2 2 3 8 7
+7 2 2 2 2 5 6 10
+8 2 2 2 2 5 10 9
+9 2 2 2 2 6 7 11
+10 2 2 2 2 6 11 10
+11 2 2 2 2 7 8 12
+12 2 2 2 2 7 12 11
+13 2 2 2 2 9 10 14
+14 2 2 2 2 9 14 13
+15 2 2 2 2 10 11 15
+16 2 2 2 2 10 15 14
+17 2 2 2 2 11 12 16
+18 2 2 2 2 11 16 15
+\$EndElements
+"""
+
 @compile_workload begin
     # Solve one frequency on the CPU backend. Running a whole request is the
     # only way to reach the driver's real call graph, and that graph -- not
@@ -123,6 +173,62 @@ const WORKLOAD_MESH = """
         redirect_stdout(devnull) do
             try
                 solve_request(request)
+                # The worker hands `solve_request` what
+                # `JSON.parse` returns, not a Dict, and the driver specialises
+                # on the request type. Solving the parsed form too caches the
+                # native code the worker actually calls.
+                solve_request(JSON.parse(JSON.json(request)))
+            catch
+                # A workload that cannot solve still leaves everything it did
+                # reach compiled, and a build must not fail over an
+                # optimisation.
+            end
+            try
+                # A request shaped like a real application solve, as the
+                # worker receives it. Two frequencies, so both the
+                # order-2 and the order-4 regular rule run; the xy symmetry,
+                # sphere grid, diagonal cut and surface traces are each code
+                # the tetrahedron request never reaches. Measured on a real
+                # first solve: most of what was still compiled at run time.
+                quadrant = joinpath(directory, "quadrant.msh")
+                write(quadrant, WORKLOAD_QUADRANT_MESH)
+                realistic = Dict{String,Any}(
+                    "schema_version" => 2,
+                    "beat_engine_backend" => "cpu",
+                    "frequencies_hz" => [1000.0, 20000.0],
+                    "config" => Dict{String,Any}(
+                        "mesh_file" => quadrant,
+                        "scale_factor" => 1.0,
+                        "meshes" => [Dict{String,Any}(
+                            "name" => "mesh", "file" => quadrant, "scale_factor" => 1.0,
+                            "translation_m" => [0.0, 0.0, 0.0],
+                        )],
+                        "distance" => 2.0,
+                        "axial_offset" => 0.0,
+                        "step_size" => 45.0,
+                        "min_angle" => 0.0,
+                        "max_angle" => 180.0,
+                        "freq_min" => 1000.0,
+                        "freq_max" => 20000.0,
+                        "freq_count" => 2,
+                        "tag_throat" => 2,
+                        "rho" => 1.2041,
+                        "sound_speed" => 343.0,
+                        "symmetry" => "xy",
+                        "flat_target_normalization_enabled" => false,
+                        "spherical_sampling_enabled" => false,
+                        "source_motion" => "normal",
+                        "quadrature_order" => 4,
+                        "singular_order" => 4,
+                        "diagonal_enabled" => true,
+                        "diagonal_inclination_deg" => 45.0,
+                        "spherical_grid" => Dict{String,Any}(
+                            "theta_count" => 3, "phi_count" => 4, "theta_max_deg" => 180.0,
+                        ),
+                        "surface_traces_enabled" => true,
+                    ),
+                )
+                solve_request(JSON.parse(JSON.json(realistic)))
             catch
                 # A workload that cannot solve still leaves everything it did
                 # reach compiled, and a build must not fail over an
