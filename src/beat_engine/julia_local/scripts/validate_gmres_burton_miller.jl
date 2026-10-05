@@ -60,6 +60,8 @@
 #   BLAB_VALIDATE_MESH_PATH   absolute mesh path (default: the bundled sample)
 #   BLAB_VALIDATE_SCALE       mesh scale (default 0.001 for the sample)
 #   BLAB_VALIDATE_SYMMETRY    off | x | xy
+#   BLAB_VALIDATE_BACKEND     cpu | metal (default cpu; a test, not a benchmark)
+#   BLAB_VALIDATE_DRIVE_TAG   physical driver tag (default 2)
 #   BLAB_VALIDATE_DRIVES      independent drive columns (default 2)
 #   BLAB_VALIDATE_FREQUENCY_HZ  default 2000
 #   BLAB_VALIDATE_GMRES_AGREEMENT  default 1e-4
@@ -82,6 +84,9 @@ function validate_gmres_burton_miller()
         mesh_path = joinpath(@__DIR__, "..", "test_meshes", get(ENV, "BLAB_VALIDATE_MESH", "sample.msh"))
     end
     symmetry_mode = Symbol(get(ENV, "BLAB_VALIDATE_SYMMETRY", "off"))
+    backend = Symbol(get(ENV, "BLAB_VALIDATE_BACKEND", "cpu"))
+    backend in (:cpu, :metal) || error("Validator backend must be cpu or metal.")
+    drive_tag = parse(Int, get(ENV, "BLAB_VALIDATE_DRIVE_TAG", "2"))
     drive_count = parse(Int, get(ENV, "BLAB_VALIDATE_DRIVES", "2"))
     regular_order = parse(Int, get(ENV, "BLAB_VALIDATE_REGULAR_ORDER", "4"))
     singular_order = parse(Int, get(ENV, "BLAB_VALIDATE_SINGULAR_ORDER", "4"))
@@ -134,6 +139,13 @@ function validate_gmres_burton_miller()
     identity_p1_p1 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :p1; symmetry_mode=symmetry_mode)
     identity_p1_dp0 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0; symmetry_mode=symmetry_mode)
 
+    metal_kwargs = backend === :metal ? (
+        device_cache=build_metal_regular_assembly_cache(
+            mesh, p1, dp0, rule; singular_order=singular_order, symmetry_mode=symmetry_mode,
+        ),
+        device_singular_cache=build_metal_singular_correction_cache(singular_cache),
+    ) : (;)
+
     n = p1.global_dof_count
     println("fixture=$(mesh_path) scale=$(scale) symmetry=$(symmetry_mode)")
     println("faces=$(length(mesh.faces)) p1_dofs=$n frequencies=$(frequencies) drives=$(drive_count)")
@@ -157,7 +169,7 @@ function validate_gmres_burton_miller()
         q = zeros(ComplexF32, dp0.global_dof_count, drive_count)
         coefficient = ComplexF32(0, 1) * 1.2041f0 * k * 343.0f0
         @inbounds for index in eachindex(mesh.faces)
-            mesh.physical_tags[index] == 2 || continue
+            mesh.physical_tags[index] == drive_tag || continue
             for drive in 1:drive_count
                 q[dp0.local_to_global[index], drive] = coefficient * cis(Float32(0.7 * (drive - 1)))
             end
@@ -167,19 +179,31 @@ function validate_gmres_burton_miller()
         all(iszero, q) && (q .= coefficient)
         return q
     end
+    sweep_state = BeatEngineCore.BeatDenseSweepState(Float32)
+    try
     for frequency_hz in frequencies
     k = Float32(2pi) * frequency_hz / 343.0f0
     println()
     println("--- $(frequency_hz) Hz ---")
     q_neumann = physical_drive(k)
-    system = assemble_burton_miller_neumann_system_cpu(
+    assembler = backend === :metal ? assemble_burton_miller_neumann_system_metal :
+                                    assemble_burton_miller_neumann_system_cpu
+    system = assembler(
         mesh, p1, dp0, q_neumann, k, rule;
         identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
         skip_singular=false, singular_order=singular_order,
-        singular_cache=singular_cache, symmetry_mode=symmetry_mode,
+        singular_cache=singular_cache, symmetry_mode=symmetry_mode, metal_kwargs...,
     )
-    matrix = system.matrix
-    rhs = system.rhs
+    if backend === :metal
+        try
+            host = metal_host_burton_miller_system(system)
+            matrix, rhs = copy(host.matrix), copy(host.rhs)
+        finally
+            release_metal_burton_miller_system!(system)
+        end
+    else
+        matrix, rhs = system.matrix, system.rhs
+    end
 
     reference = lu(copy(matrix)) \ rhs
     reference_scale = max(norm(reference), eps(Float32))
@@ -229,6 +253,18 @@ function validate_gmres_burton_miller()
               "$(frequency_hz) Hz drive $drive: recomputed relative residual $(residual) " *
               "exceeds $(residual_bound) (4x tolerance, or the Float32 evaluation floor)")
     end
+
+    warm_solution, warm_report = beat_solve_dense_system(
+        matrix, rhs; method=:gmres, sweep_state=sweep_state, frequency=frequency_hz,
+    )
+    warm_agreement = norm(warm_solution - reference) / reference_scale
+    @printf("warm_vs_lu_relative=%.3e iterations=%s used=%s fallback=%s\n",
+            warm_agreement, warm_report.iterations, warm_report.warm_start_used,
+            warm_report.fallback_reason)
+    check(warm_agreement <= agreement_tolerance,
+          "$(frequency_hz) Hz: warm solution disagrees with LU by $(warm_agreement)")
+    check(warm_report.fell_back || all(<=(tolerance), warm_report.relative_residuals),
+          "$(frequency_hz) Hz: warm solve missed its true residual tolerance")
 
     # The routing decision itself must be reported, not silently taken.
     plan = report.plan
@@ -314,6 +350,13 @@ function validate_gmres_burton_miller()
         println("FAIL: $failure")
     end
     return false
+    finally
+        if backend === :metal
+            release_metal_regular_assembly_cache!(metal_kwargs.device_cache)
+            release_metal_singular_correction_cache!(metal_kwargs.device_singular_cache)
+        end
+    end
+
 end
 
 validate_gmres_burton_miller() || exit(1)

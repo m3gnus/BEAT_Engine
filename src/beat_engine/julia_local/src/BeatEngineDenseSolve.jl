@@ -275,7 +275,9 @@ end
 
 One is the value that makes the argument: at a budget of one LU, a GMRES that
 exhausts it has spent one LU of matvecs, so it has provably lost and the
-remaining work belongs on the factorization.
+remaining work belongs on the factorization according to the calibrated model.
+A sweep remembers a failed attempt and routes nearby frequencies to LU;
+repeatedly paying this allowance before the same fallback is avoidable.
 
 This bounds matvecs, **not** wall clock, and the gap between those is not
 small. An iteration also orthogonalizes against `j` prior vectors, and that
@@ -324,8 +326,9 @@ const BEAT_GMRES_TIME_CEILING_DEFAULT = 2.0
 """
     beat_gmres_iteration_budget(n, drive_count)
 
-Total matvecs a model-chosen GMRES may spend across every drive before the
-dense LU is provably the cheaper answer.
+Initial matvec allowance for a model-chosen GMRES across every drive.
+The shared wall deadline continues to bound cost when this model is stale.
+`_beat_dense_sweep_plan` avoids retrying it near a previous request-local fallback.
 
 `BEAT_GMRES_MODEL_ITERATIONS` is the model's weakest constant by a wide margin.
 It ships at 70; measured on this branch over three meshes and three frequencies
@@ -493,7 +496,8 @@ end
     beat_gmres!(x, matrix, b; tolerance, max_iterations, restart, preconditioner,
                 deadline_seconds, deadline_ns, clock_ns)
 
-Solve `matrix * x = b` in place. Left diagonal preconditioning is applied
+Solve `matrix * x = b` in place, starting from the supplied `x`. Callers use
+a zero vector for a cold start. Left diagonal preconditioning is applied
 internally; `tolerance` is on the true relative residual `||b - A x|| / ||b||`,
 which is verified against the operator rather than trusted from the Givens
 recursion.
@@ -566,6 +570,14 @@ function beat_gmres!(x::AbstractVector{Complex{T}},
         copyto!(residual, b)
         mul!(residual, matrix, x, -one(Complex{T}), one(Complex{T}))
         relative = T(norm(residual) / b_norm)
+        # A caller-supplied guess must not make the cold solve worse. The sweep
+        # projection checks this too, but beat_gmres! also accepts x directly.
+        # Reuse this first residual check, including for non-finite guesses.
+        if total_iterations == 0 && (!isfinite(relative) || relative > one(T))
+            fill!(x, zero(Complex{T}))
+            copyto!(residual, b)
+            relative = one(T)
+        end
         relative <= tol && return BeatGmresResult{T}(true, total_iterations, relative, :converged)
         if wall_deadline_ns > 0 && clock_ns() >= wall_deadline_ns
             return BeatGmresResult{T}(false, total_iterations, relative, :deadline)
@@ -865,6 +877,77 @@ _beat_gmres_restart() = _beat_env_int(BEAT_GMRES_RESTART_ENV, 0; allow_zero=true
 
 # --- Router -----------------------------------------------------------------
 
+# Owned by one request's solve consumer, never by the assembly producer or a
+# worker-global cache. Columns keep the request's fixed drive ordering. Only
+# completed solves enter history, including correct LU fallback solutions.
+mutable struct BeatDenseSweepState{T<:AbstractFloat}
+    solutions::Vector{Matrix{Complex{T}}}
+    previous_frequency::Float64
+    fallback_frequency::Float64
+end
+BeatDenseSweepState(::Type{T}) where {T<:AbstractFloat} =
+    BeatDenseSweepState{T}(Matrix{Complex{T}}[], NaN, NaN)
+
+_beat_near_frequency(a, b) = isfinite(a) && isfinite(b) && a > 0 && b > 0 &&
+                            max(a, b) / min(a, b) <= 1.5
+
+# The request-local backoff is symmetric in frequency, including reversed or
+# jumping sweeps. In a three-round physical-drive comparison a 1.5 ratio had
+# fewer repeated failures than 1.25, with their time difference inside variance.
+# It is triggered by observed failure, never by an absolute frequency cutoff.
+# Explicit LU/GMRES overrides keep their meaning.
+function _beat_dense_sweep_plan(plan, state, frequency)
+    if state !== nothing && plan.method === :gmres && plan.reason === :model &&
+       _beat_near_frequency(state.fallback_frequency, frequency)
+        return merge(plan, (method=:lu, reason=:recent_fallback,
+                            fallback_frequency_hz=state.fallback_frequency))
+    end
+    return plan
+end
+
+# Minimum residual over at most six previous solutions, separately per drive.
+# A thin SVD handles repeated frequencies and dependent/zero drive histories.
+# Evaluate acceptance in the operator's precision after rounding the guess:
+# the projected least-squares residual alone cannot validate that rounding.
+function beat_sweep_guess!(solution, matrix, rhs, state)
+    fill!(solution, zero(eltype(solution)))
+    used = falses(size(rhs, 2))
+    state === nothing && return used
+    isempty(state.solutions) && return used
+    all(x -> size(x) == size(rhs), state.solutions) ||
+        error("Dense sweep history dimensions changed within a request.")
+    for drive in axes(rhs, 2)
+        X = hcat([view(x, :, drive) for x in state.solutions]...)
+        Y = matrix * X
+        all(isfinite, Y) || continue
+        factor = svd(ComplexF64.(Y); full=false)
+        isempty(factor.S) && continue
+        cutoff = maximum(factor.S) * max(size(Y)...) * eps(Float64)
+        coefficients = factor.U' * ComplexF64.(view(rhs, :, drive))
+        for i in eachindex(factor.S)
+            coefficients[i] = factor.S[i] > cutoff ? coefficients[i] / factor.S[i] : 0
+        end
+        guess = eltype(solution).(ComplexF64.(X) * (factor.V * coefficients))
+        all(isfinite, guess) || continue
+        residual = copy(view(rhs, :, drive))
+        mul!(residual, matrix, guess, -one(eltype(solution)), one(eltype(solution)))
+        if norm(residual) < norm(view(rhs, :, drive))
+            solution[:, drive] .= guess
+            used[drive] = true
+        end
+    end
+    return used
+end
+
+function _beat_record_sweep!(state, frequency, solution, fell_back)
+    state === nothing && return nothing
+    push!(state.solutions, copy(solution))
+    length(state.solutions) > 6 && popfirst!(state.solutions)
+    state.previous_frequency = Float64(frequency)
+    fell_back && (state.fallback_frequency = Float64(frequency))
+    return nothing
+end
+
 """
     beat_solve_dense_system(matrix, rhs; method=..., preserve_matrix=true)
 
@@ -876,6 +959,14 @@ Returns `(solution, report)`. The report carries the plan, the method actually
 used, per-drive iteration counts, residuals and termination reasons, and
 `fell_back` plus `fallback_reason` when GMRES was chosen and did not deliver.
 
+`sweep_state`, when supplied, must belong to this request alone, with fixed
+column/drive identities and a positive `frequency`. It retains at most six
+completed solutions in consumption order, projects their span on the new
+operator, and routes within a 1.5 frequency ratio of a previous fallback to LU.
+The initial iteration budget, wall deadline, per-drive cap and LU fallback
+remain active when the model chooses GMRES again. The assembly
+producer must never read or update this state.
+
 `preserve_matrix` is true because the fused Metal path hands over a shared
 device buffer the caller still owns; `lu!` would overwrite it. GMRES never
 writes to the matrix, so choosing GMRES also avoids the N^2 complex copy the
@@ -884,37 +975,46 @@ LU path needs -- 3.3 GB at 20,422 dofs.
 function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
                                  rhs::AbstractVecOrMat{Complex{T}};
                                  method::Symbol=beat_dense_solve_method(),
-                                 preserve_matrix::Bool=true) where {T<:AbstractFloat}
+                                 preserve_matrix::Bool=true,
+                                 sweep_state::Union{Nothing,BeatDenseSweepState{T}}=nothing,
+                                 frequency::Real=NaN) where {T<:AbstractFloat}
+    if sweep_state !== nothing
+        isfinite(frequency) && frequency > 0 ||
+            error("A dense sweep state requires a positive finite frequency.")
+    end
     rhs_matrix = rhs isa AbstractMatrix ? rhs : reshape(rhs, :, 1)
     n = size(matrix, 1)
     drive_count = size(rhs_matrix, 2)
-    plan = beat_dense_solve_plan(n, drive_count; method=method)
-
+    plan = _beat_dense_sweep_plan(
+        beat_dense_solve_plan(n, drive_count; method=method), sweep_state, frequency,
+    )
+    tolerance = _beat_gmres_tolerance(T)
     if plan.method === :gmres
+        started = time_ns()
         solution = similar(rhs_matrix, Complex{T}, n, drive_count)
-        fill!(solution, zero(Complex{T}))
+        projected_start = beat_sweep_guess!(solution, matrix, rhs_matrix, sweep_state)
+        warm_start_used = falses(drive_count)
         inverse_diagonal = beat_diagonal_preconditioner(matrix)
         iterations = Int[]
         residuals = T[]
         termination_reasons = Symbol[]
         converged = true
         fallback_reason = nothing
-        # A model-chosen GMRES gets one LU's worth of matvecs across every
-        # drive; an explicitly requested one is left alone. `ceiling` is the
-        # hard stall guard and still applies.
+        # Keep the calibrated shared budget and the explicit per-drive cap.
+        # A failed auto attempt prevents nearby retries through the sweep plan;
+        # a forced GMRES keeps its explicit cap and load-bearing LU fallback.
         ceiling = _beat_gmres_max_iterations(n)
         remaining = plan.reason === :model ?
                     beat_gmres_iteration_budget(n, drive_count) : typemax(Int)
-        # Both budgets are totals shared across drives, and both apply only to
-        # a model-chosen run. The matvec one says GMRES has provably lost; the
-        # wall-clock one is what actually bounds the damage, because the
-        # orthogonalization the matvec count ignores overtakes the matvec.
+        iteration_allowance = remaining
+        # Both budgets are shared across drives and apply only to auto routing.
+        # History must not remove the calibrated bound on orthogonalization.
         time_allowance = plan.reason === :model ?
                          _beat_env_float(BEAT_GMRES_TIME_CEILING_ENV, BEAT_GMRES_TIME_CEILING_DEFAULT) *
                          beat_dense_lu_seconds(n, drive_count) : 0.0
         deadline_ns = time_allowance > 0 ?
-                      time_ns() + UInt64(max(1, round(Int, time_allowance * 1e9))) : UInt64(0)
-        gmres_elapsed = @elapsed for drive in 1:drive_count
+                      started + UInt64(max(1, round(Int, time_allowance * 1e9))) : UInt64(0)
+        for drive in 1:drive_count
             if plan.reason === :model && remaining <= 0
                 converged = false
                 fallback_reason = :iteration_budget
@@ -928,8 +1028,10 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
             column = view(solution, :, drive)
             drive_budget = min(ceiling, remaining)
             shared_budget_limited = plan.reason === :model && remaining <= ceiling
+            warm_start_used[drive] = projected_start[drive]
             result = beat_gmres!(column, matrix, Vector{Complex{T}}(view(rhs_matrix, :, drive));
                                  preconditioner=inverse_diagonal,
+                                 tolerance=tolerance,
                                  max_iterations=drive_budget,
                                  deadline_ns=deadline_ns)
             push!(iterations, result.iterations)
@@ -947,6 +1049,7 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
             end
         end
         if converged
+            _beat_record_sweep!(sweep_state, frequency, solution, false)
             return solution, (
                 plan=plan,
                 method=:gmres,
@@ -955,13 +1058,17 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
                 iterations=iterations,
                 relative_residuals=residuals,
                 termination_reasons=termination_reasons,
-                seconds=gmres_elapsed,
+                iteration_budget=plan.reason === :model ? iteration_allowance : nothing,
+                warm_start_used=warm_start_used,
+                tolerance=tolerance,
+                seconds=(time_ns() - started) / 1e9,
             )
         end
         # Non-convergence is reported, never raised. The dense LU always
         # answers on this operator, and a slower correct solve beats a crash.
         @warn "BEAT GMRES stopped; falling back to the dense LU." dofs = n drives = drive_count reason = fallback_reason iterations = iterations relative_residuals = residuals
-        lu_solution, lu_elapsed = _beat_dense_lu_solve(matrix, rhs_matrix, preserve_matrix)
+        lu_solution, _ = _beat_dense_lu_solve(matrix, rhs_matrix, preserve_matrix)
+        _beat_record_sweep!(sweep_state, frequency, lu_solution, true)
         return lu_solution, (
             plan=plan,
             method=:lu,
@@ -970,11 +1077,15 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
             iterations=iterations,
             relative_residuals=residuals,
             termination_reasons=termination_reasons,
-            seconds=gmres_elapsed + lu_elapsed,
+            iteration_budget=plan.reason === :model ? iteration_allowance : nothing,
+            warm_start_used=warm_start_used,
+            tolerance=tolerance,
+            seconds=(time_ns() - started) / 1e9,
         )
     end
 
     solution, elapsed = _beat_dense_lu_solve(matrix, rhs_matrix, preserve_matrix)
+    _beat_record_sweep!(sweep_state, frequency, solution, false)
     return solution, (
         plan=plan,
         method=:lu,
@@ -983,6 +1094,9 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
         iterations=Int[],
         relative_residuals=T[],
         termination_reasons=Symbol[],
+        iteration_budget=nothing,
+        warm_start_used=falses(drive_count),
+        tolerance=tolerance,
         seconds=elapsed,
     )
 end
@@ -1005,13 +1119,16 @@ regression nobody attributes correctly six weeks later.
 """
 function describe_dense_solve(report)
     plan = report.plan
-    selection = plan.reason === :override ? "forced" : "cost model"
+    selection = plan.reason === :override ? "forced" :
+                plan.reason === :recent_fallback ?
+                "recent GMRES fallback at $(plan.fallback_frequency_hz) Hz" : "cost model"
     if report.method === :gmres
         iterations = isempty(report.iterations) ? 0 : maximum(report.iterations)
         residual = isempty(report.relative_residuals) ? 0.0 : maximum(report.relative_residuals)
         return "Julia GMRES, diagonal preconditioner ($selection): $(plan.dofs) dofs, " *
             "$(plan.drives) drive(s), up to $iterations iterations, " *
-            "relative residual $(round(residual; sigdigits=3))"
+            "relative residual $(round(residual; sigdigits=3)), " *
+            "warm start $(count(report.warm_start_used))/$(plan.drives) drive(s)"
     end
     if report.fell_back
         iterations = isempty(report.iterations) ? 0 : maximum(report.iterations)
@@ -1032,4 +1149,24 @@ function describe_dense_solve(report)
             "$(plan.dofs) dofs, $(plan.drives) drive(s)"
     end
     return "Julia direct dense solve ($selection): $(plan.dofs) dofs, $(plan.drives) drive(s)"
+end
+
+# Both public drivers expose the same per-frequency facts. Residuals and
+# iterations describe attempted GMRES drives even when LU supplied the answer.
+function beat_dense_solve_diagnostics(report)
+    return Dict{String,Any}(
+        "dense_solve_method" => String(report.method),
+        "dense_solve_selection" => String(report.plan.reason),
+        "dense_solve_recent_fallback_hz" => get(report.plan, :fallback_frequency_hz, nothing),
+        "dense_solve_fell_back" => report.fell_back,
+        "dense_solve_fallback_reason" => report.fallback_reason,
+        "dense_solve_iterations" => report.iterations,
+        "dense_solve_iteration_budget" => report.iteration_budget,
+        "dense_solve_relative_residuals" => report.relative_residuals,
+        "dense_solve_termination_reasons" => report.termination_reasons,
+        "dense_solve_warm_start_used" => report.warm_start_used,
+        "dense_solve_tolerance" => report.tolerance,
+        "dense_solve_model_lu_s" => report.plan.lu_model_seconds,
+        "dense_solve_model_gmres_s" => report.plan.gmres_model_seconds,
+    )
 end

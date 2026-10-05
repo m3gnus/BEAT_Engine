@@ -661,6 +661,167 @@ end
     end
 
 
+    @testset "warm starts preserve the true residual and isolate drives" begin
+        n = 96
+        matrix = ComplexF32[
+            ComplexF32(cos(0.5f0 * row * column), sin(0.25f0 * (row + column))) / Float32(n)
+            for row in 1:n, column in 1:n
+        ] + Matrix{ComplexF32}(1.5f0 * I, n, n)
+        rhs = ComplexF32[ComplexF32(sin(0.3f0 * row * drive), cos(0.7f0 * row + drive))
+                         for row in 1:n, drive in 1:2]
+        reference = matrix \ rhs
+        state = BeatEngineCore.BeatDenseSweepState(Float32)
+        cold, cold_report = beat_solve_dense_system(matrix, rhs; method=:gmres,
+                                                    sweep_state=state, frequency=200)
+        @test !any(cold_report.warm_start_used)
+        # Repeat and reverse frequencies; no interpolation or monotonic-order
+        # assumption. Duplicate histories deliberately make the span deficient.
+        for f in (220, 210, 210, 200, 240, 205, 220, 230)
+            warm, report = beat_solve_dense_system(matrix, rhs; method=:gmres,
+                                                   sweep_state=state, frequency=f)
+            @test all(report.warm_start_used)
+            @test all(<=(1.0f-5), report.relative_residuals)
+            @test norm(matrix * warm - rhs) / norm(rhs) <= 1.0f-5
+            @test norm(warm - reference) / norm(reference) <= 1.0f-4
+            @test sum(report.iterations) < sum(cold_report.iterations)
+        end
+        @test length(state.solutions) == 6
+        @test state.solutions[end] !== cold
+        # A new request cannot use the old request's solutions.
+        fresh = BeatEngineCore.BeatDenseSweepState(Float32)
+        _, fresh_report = beat_solve_dense_system(matrix, rhs; method=:gmres,
+                                                   sweep_state=fresh, frequency=230)
+        @test !any(fresh_report.warm_start_used)
+        @test fresh_report.iterations == cold_report.iterations
+
+        # beat_gmres! accepts x as its initial guess. A poor finite guess must
+        # still reach the same true residual as a zero guess.
+        x = fill(ComplexF32(100, -100), n)
+        result = beat_gmres!(x, matrix, rhs[:, 1]; tolerance=1e-5)
+        @test result.converged
+        @test result.relative_residual <= 1.0f-5
+        @test norm(matrix * x - rhs[:, 1]) / norm(rhs[:, 1]) <= 1.0f-5
+        @test norm(x - reference[:, 1]) / norm(reference[:, 1]) <= 1.0f-4
+        @test result.iterations == cold_report.iterations[1]
+        fill!(x, ComplexF32(NaN))
+        invalid = beat_gmres!(x, matrix, rhs[:, 1]; tolerance=1e-5)
+        @test invalid.converged
+        @test invalid.iterations == cold_report.iterations[1]
+        @test norm(matrix * x - rhs[:, 1]) / norm(rhs[:, 1]) <= 1.0f-5
+
+        # Empty, unhelpful and non-finite spans all leave a zero guess. Zero
+        # drives must remain zero even when other drives have useful history.
+        guess = zeros(ComplexF32, n, 2)
+        @test !any(BeatEngineCore.beat_sweep_guess!(guess, matrix, rhs,
+                                                    BeatEngineCore.BeatDenseSweepState(Float32)))
+        state.solutions = [zeros(ComplexF32, n, 2)]
+        @test !any(BeatEngineCore.beat_sweep_guess!(guess, matrix, rhs, state))
+        state.solutions = [fill(ComplexF32(NaN), n, 2)]
+        @test !any(BeatEngineCore.beat_sweep_guess!(guess, matrix, rhs, state))
+        @test all(iszero, guess)
+        state.solutions = [copy(reference)]
+        zero_drive_rhs = hcat(rhs[:, 1], zeros(ComplexF32, n))
+        used = BeatEngineCore.beat_sweep_guess!(guess, matrix, zero_drive_rhs, state)
+        @test used == [true, false]
+        @test all(iszero, guess[:, 2])
+    end
+
+    @testset "history follows pipeline consumption and ends with cancellation" begin
+        frequencies = [200.0, 260.0, 220.0, 220.0, 900.0, 210.0]
+        n = 24
+        function run_sweep(pipelined; stop_after=length(frequencies))
+            state = BeatEngineCore.BeatDenseSweepState(Float32)
+            make_system = index -> (
+                matrix=Matrix{ComplexF32}(2I, n, n) +
+                       ComplexF32[0.01cis(Float32(i * j + index)) for i in 1:n, j in 1:n],
+                rhs=ComplexF32[cis(Float32(i * d + index / 100)) for i in 1:n, d in 1:2],
+            )
+            release = payload -> fill!(payload.rhs, 0)
+            pipeline = pipelined ? start_sweep_assembly_pipeline(make_system, length(frequencies), 3, release) : nothing
+            answers, reports = Any[], Any[]
+            try
+                for index in eachindex(frequencies)
+                    index > stop_after && break  # cancellation before consuming the next solve
+                    payload = pipelined ? take_sweep_assembly!(pipeline, index) : make_system(index)
+                    x, report = beat_solve_dense_system(payload.matrix, payload.rhs;
+                        method=:gmres, sweep_state=state, frequency=frequencies[index])
+                    push!(answers, x); push!(reports, report)
+                    release(payload)
+                end
+            finally
+                shutdown_sweep_assembly_pipeline!(pipeline, release)
+            end
+            return answers, reports, state
+        end
+        sequential, sr, _ = run_sweep(false)
+        pipelined, pr, _ = run_sweep(true)
+        @test sequential == pipelined
+        @test [r.iterations for r in sr] == [r.iterations for r in pr]
+        @test !any(pr[1].warm_start_used)
+        @test all(r -> all(r.warm_start_used), pr[2:end])
+        cancelled, _, history = run_sweep(true; stop_after=2)
+        @test length(cancelled) == 2
+        @test length(history.solutions) == 2
+        @test history.previous_frequency == frequencies[2]
+        @test all(x -> any(!iszero, x), history.solutions)
+        # A subsequent request always starts cold, including after cancellation.
+        _, next_reports, _ = run_sweep(true; stop_after=1)
+        @test !any(next_reports[1].warm_start_used)
+    end
+
+    @testset "a fallback prevents neighboring retries without disabling GMRES" begin
+        n = 64
+        # Two eigenvalues cannot converge in the deliberately misrouted
+        # one-step budget. Nearby solves must go straight to the correct LU;
+        # a frequency outside the backoff window must try the model again.
+        matrix = Matrix{ComplexF32}(2I, n, n)
+        for i in 1:2:n
+            matrix[i, i + 1] = matrix[i + 1, i] = 1
+        end
+        rhs = ComplexF32[ComplexF32(sin(0.3f0 * i), cos(0.7f0 * i)) for i in 1:n]
+        state = BeatEngineCore.BeatDenseSweepState(Float32)
+        withenv("BLAB_BEAT_GMRES_MODEL_ITERATIONS" => "1e-9",
+                "BLAB_BEAT_GMRES_BUDGET" => "1e-12",
+                "BLAB_BEAT_GMRES_TIME_CEILING" => "1e12") do
+            _, failed = beat_solve_dense_system(matrix, rhs; sweep_state=state, frequency=200)
+            @test failed.fell_back
+            @test failed.fallback_reason === :iteration_budget
+            @test state.fallback_frequency == 200
+            for f in (220, 180, 300, 200)
+                # Vary the drive so a cached solution alone cannot answer it.
+                b = rhs .* ComplexF32(cis(Float32(f / 100)))
+                x, report = beat_solve_dense_system(matrix, b; sweep_state=state, frequency=f)
+                @test report.method === :lu
+                @test report.plan.reason === :recent_fallback
+                @test !report.fell_back
+                @test isempty(report.iterations)
+                @test !any(report.warm_start_used)
+                @test norm(matrix * vec(x) - b) / norm(b) < 1.0f-5
+                @test state.fallback_frequency == 200  # no sliding suppression window
+                @test occursin("recent GMRES fallback", describe_dense_solve(report))
+                @test BeatEngineCore.beat_dense_solve_diagnostics(report)["dense_solve_recent_fallback_hz"] == 200
+            end
+            _, resumed = beat_solve_dense_system(matrix, rhs; sweep_state=state, frequency=301)
+            @test resumed.plan.reason === :model
+            @test resumed.method === :gmres
+            @test resumed.warm_start_used == [true]
+            @test resumed.iterations == [0]
+            @test state.fallback_frequency == 200
+            # Both kinds of explicit override retain their meaning inside the
+            # window, and a new request starts with the model, without backoff.
+            _, forced = beat_solve_dense_system(matrix, rhs; sweep_state=state, frequency=220, method=:gmres)
+            @test forced.method === :gmres
+            @test forced.plan.reason === :override
+            _, direct = beat_solve_dense_system(matrix, rhs; sweep_state=state, frequency=220, method=:lu)
+            @test direct.method === :lu
+            @test direct.plan.reason === :override
+            fresh = BeatEngineCore.BeatDenseSweepState(Float32)
+            _, fresh_report = beat_solve_dense_system(matrix, rhs; sweep_state=fresh, frequency=220)
+            @test fresh_report.plan.reason === :model
+            @test fresh_report.fell_back
+        end
+    end
+
     @testset "krylov space precision and orthogonality" begin
         # A spectrum on a circle that nearly touches the origin: GMRES has to
         # build a real Krylov space rather than terminating in a few steps.

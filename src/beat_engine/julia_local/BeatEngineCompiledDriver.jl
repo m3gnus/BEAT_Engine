@@ -889,25 +889,30 @@ function assemble_exterior_direct_metal(
     return system, (time_ns() - started) / 1.0e9
 end
 
-function solve_exterior_direct_metal_system(system)
+function solve_exterior_direct_metal_system(system; sweep_state=nothing, frequency=NaN)
     # Metal.jl has no GPU LU, so the host reads the shared buffers in place and
     # one factorization serves every column.
     started = time_ns()
-    pressure, report = solve_metal_burton_miller_system_with_report(system)
+    pressure, report = solve_metal_burton_miller_system_with_report(
+        system; sweep_state=sweep_state, frequency=frequency,
+    )
     pressures = [copy(column) for column in eachcol(pressure)]
-    return pressures, (time_ns() - started) / 1.0e9, report.method
+    return pressures, (time_ns() - started) / 1.0e9, report
 end
 
 function solve_exterior_direct_metal(
-    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
+    mesh, p1_space, dp0_space, neumann_values, wavenumber, rule;
+    sweep_state=nothing, frequency=NaN, kwargs...,
 )
     system = nothing
     try
         system, assembly_s = assemble_exterior_direct_metal(
             mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; kwargs...,
         )
-        pressures, solve_s, method = solve_exterior_direct_metal_system(system)
-        return pressures, assembly_s, solve_s, method
+        pressures, solve_s, report = solve_exterior_direct_metal_system(
+            system; sweep_state=sweep_state, frequency=frequency,
+        )
+        return pressures, assembly_s, solve_s, report
     finally
         system === nothing || release_metal_burton_miller_system!(system)
     end
@@ -1054,6 +1059,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     # `metal_sweep_overlap_plan`. The producer builds exactly what the
     # sequential branch below builds, from the same inputs.
     frequencies_hz = request["frequencies_hz"]
+    dense_sweep_state = direct_metal_assembly &&
+                        beat_dense_solve_plan(p1_space.global_dof_count, length(excitations)).method === :gmres ?
+                        BeatEngineCore.BeatDenseSweepState(FloatType) : nothing
     metal_fused_kwargs = (
         device_cache=device_cache,
         singular_cache=singular_cache,
@@ -1140,6 +1148,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
             operators = nothing
             metal_solve_method = :lu
+            dense_solve_report = nothing
             if direct_cuda_assembly
                 pressures, assembly_s, solve_s = solve_exterior_direct_cuda(
                     mesh, p1_space, dp0_space, neumann_values, wavenumber, rule;
@@ -1157,13 +1166,18 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     "$(frequency_index), which needs k=$(wavenumber).",
                 )
                 assembly_s = produced.assembly_s
-                pressures, solve_s, metal_solve_method = solve_exterior_direct_metal_system(current_metal_system)
+                pressures, solve_s, dense_solve_report = solve_exterior_direct_metal_system(
+                    current_metal_system; sweep_state=dense_sweep_state, frequency=frequency_hz,
+                )
+                metal_solve_method = dense_solve_report.method
                 release_metal_burton_miller_system!(current_metal_system)
                 current_metal_system = nothing
             elseif direct_metal_assembly
-                pressures, assembly_s, solve_s, metal_solve_method = solve_exterior_direct_metal(
+                pressures, assembly_s, solve_s, dense_solve_report = solve_exterior_direct_metal(
                     mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; metal_fused_kwargs...,
+                    sweep_state=dense_sweep_state, frequency=frequency_hz,
                 )
+                metal_solve_method = dense_solve_report.method
             else
                 assembly_started = time_ns()
                 operators = assemble_regular_galerkin_operators(
@@ -1319,6 +1333,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     "cache_setup_s" => 0.0,
                 ),
             )
+            if dense_solve_report !== nothing
+                merge!(diagnostics, BeatEngineCore.beat_dense_solve_diagnostics(dense_solve_report))
+            end
             if overlap_plan !== nothing
                 diagnostics["metal_pipeline"] = metal_pipeline
                 diagnostics["metal_pipeline_reason"] = String(overlap_plan.reason)

@@ -1212,11 +1212,16 @@ have. GMRES has no factorization to share and pays per drive, which is exactly
 what the router weighs -- and why it is a cost comparison over both dimensions
 rather than a dof threshold.
 """
-function solve_metal_burton_miller_system_with_report(system; method::Symbol=beat_dense_solve_method())
+function solve_metal_burton_miller_system_with_report(
+    system; method::Symbol=beat_dense_solve_method(), sweep_state=nothing, frequency::Real=NaN,
+)
     host = metal_host_burton_miller_system(system)
     # lu! would overwrite the shared buffer the caller still owns; GMRES reads
     # it and needs no copy at all.
-    return beat_solve_dense_system(host.matrix, host.rhs; method=method, preserve_matrix=true)
+    return beat_solve_dense_system(
+        host.matrix, host.rhs; method=method, preserve_matrix=true,
+        sweep_state=sweep_state, frequency=frequency,
+    )
 end
 
 function solve_metal_burton_miller_system(system; method::Symbol=beat_dense_solve_method())

@@ -1088,6 +1088,9 @@ function solve_request_impl(request)
         frequency_count=length(frequencies),
     ) : nothing
     metal_pipeline = overlap_plan !== nothing && overlap_plan.enabled
+    dense_sweep_state = beat_backend == :metal && fused_burton_miller &&
+                        beat_dense_solve_plan(p1_space.global_dof_count, length(channel_names)).method === :gmres ?
+                        BeatEngineCore.BeatDenseSweepState(FloatType) : nothing
     assemble_for_frequency = function (k_value)
         started = time()
         if fused_burton_miller
@@ -1299,7 +1302,9 @@ function solve_request_impl(request)
             # per drive, which is why the router weighs both dimensions.
             t_solve += @elapsed begin
                 fused_pressure, dense_solve_report = beat_backend == :metal ?
-                    solve_metal_burton_miller_system_with_report(assembly_payload.system) :
+                    solve_metal_burton_miller_system_with_report(
+                        assembly_payload.system; sweep_state=dense_sweep_state, frequency=freq,
+                    ) :
                     solve_burton_miller_neumann_system_cpu_with_report(assembly_payload.system)
             end
         elseif beat_backend == :cpu
@@ -1433,6 +1438,18 @@ function solve_request_impl(request)
                         dense_solve_report.fell_back,
                     "dense_solve_iterations" => dense_solve_report === nothing ? Int[] :
                         dense_solve_report.iterations,
+                    "dense_solve_recent_fallback_hz" => dense_solve_report === nothing ? nothing :
+                        get(dense_solve_report.plan, :fallback_frequency_hz, nothing),
+                    "dense_solve_iteration_budget" => dense_solve_report === nothing ? nothing :
+                        dense_solve_report.iteration_budget,
+                    "dense_solve_warm_start_used" => dense_solve_report === nothing ? Bool[] :
+                        dense_solve_report.warm_start_used,
+                    "dense_solve_fallback_reason" => dense_solve_report === nothing ? nothing :
+                        dense_solve_report.fallback_reason,
+                    "dense_solve_termination_reasons" => dense_solve_report === nothing ? Symbol[] :
+                        dense_solve_report.termination_reasons,
+                    "dense_solve_tolerance" => dense_solve_report === nothing ? nothing :
+                        dense_solve_report.tolerance,
                     "dense_solve_relative_residuals" => dense_solve_report === nothing ? Float32[] :
                         Float32.(dense_solve_report.relative_residuals),
                     "dense_solve_model_lu_s" => dense_solve_report === nothing ? nothing :
