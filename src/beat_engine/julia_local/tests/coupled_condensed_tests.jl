@@ -1,4 +1,5 @@
 include(joinpath(@__DIR__, "coupled_condensed_test_setup.jl"))
+include(joinpath(@__DIR__, "condensed_backend_tests.jl"))
 
 @testset "Schur condensation algebra" begin
     system, operators, retained = condensed_synthetic_case(Float64)

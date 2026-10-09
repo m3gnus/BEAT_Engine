@@ -3132,6 +3132,7 @@ function solve_request_impl(request; event_mode=false)
                     regular_quadrature_order=quadrature_selections[frequency_index].order,
                     singular_order=singular_order,
                     cache=coupled_cache,
+                    bem_backend=bem_backend,
                     validation_diagnostics=validation_diagnostics,
                     retain_interface_radiation=radiation_requested,
                     symmetry_mode=symmetry_mode,

@@ -1937,6 +1937,7 @@ function build_condensed_coupled_system(
     regular_quadrature_order::Union{Nothing,Int}=nothing,
     singular_order::Int=2,
     cache=nothing,
+    bem_backend::Union{Nothing,Symbol}=nothing,
     validation_diagnostics::Bool=false,
     retain_interface_radiation::Bool=false,
     symmetry_mode::Symbol=:off,
@@ -1968,7 +1969,14 @@ function build_condensed_coupled_system(
     )
     # Optimization switches resolve against the cache's backend (unset: on for Metal, the reductions and refined LU on CPU, off elsewhere);
     # `optimization_fallbacks` records every `auto` switch that could not be used, and why.
-    bem_backend = isnothing(cache) ? :cpu : cache.base.bem_backend
+    # An omitted backend inherits a supplied cache for existing direct callers.
+    # An uncached request must retain the backend selected by its driver.
+    bem_backend = isnothing(bem_backend) ?
+                  (isnothing(cache) ? :cpu : cache.base.bem_backend) : bem_backend
+    bem_backend in (:cpu, :metal) ||
+        error("Condensed coupled BEM backend must be :cpu or :metal; got $bem_backend.")
+    !isnothing(cache) && cache.base.bem_backend != bem_backend &&
+        error("Condensed coupled cache backend does not match the requested BEM backend.")
     optimization_fallbacks = String[]
     # The cache is keyed on the full moving-surface set either way; only the Schur block changes.
     transducer_condensation_mode = isempty(transducers) ? :off : _transducer_condensation_mode(bem_backend)
@@ -1991,6 +1999,7 @@ function build_condensed_coupled_system(
         interface_map;
         quadrature_order=selected_quadrature_order,
         singular_order=singular_order,
+        bem_backend=bem_backend,
         symmetry_mode=symmetry_mode,
         retained_fem_vertices=retained_fem_vertices,
         bulk_loss_factor_by_vertex=(

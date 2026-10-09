@@ -1224,6 +1224,29 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             transducer_operators=condensed_transducer_operators,
         )
         condensed_system = build_metal_condensed()
+        # Cache-off must assemble and evaluate on the explicitly requested Metal
+        # backend too; previously it built a CPU field cache and dispatch failed.
+        uncached_system = build_condensed_coupled_system(
+            fem_mesh, bem_mesh, interface_map, Float32(500), Float32(343), Float32(1.21);
+            common_options..., bem_backend=:metal,
+            transducer_operators=condensed_transducer_operators,
+        )
+        try
+            @test uncached_system.bem_backend == :metal
+            @test !(uncached_system.field_cache isa BeatEngineCore.FieldEvaluationCache)
+            uncached_solution = only(solve_condensed_coupled_systems(uncached_system, [radiator_tag]))
+            cached_solution = only(solve_condensed_coupled_systems(condensed_system, [radiator_tag]))
+            points = SVector{3,Float32}[SVector(0.3f0, 0.1f0, 1.0f0), SVector(0.1f0, 0.3f0, 1.0f0)]
+            uncached_field = evaluate_galerkin_field_metal(points, bem_mesh,
+                uncached_solution.bem_pressure, uncached_solution.bem_neumann,
+                uncached_system.wavenumber, uncached_system.field_cache)
+            cached_field = evaluate_galerkin_field_metal(points, bem_mesh,
+                cached_solution.bem_pressure, cached_solution.bem_neumann,
+                condensed_system.wavenumber, condensed_system.field_cache)
+            @test norm(uncached_field-cached_field)/norm(cached_field) < 1e-3
+        finally
+            release_condensed_coupled_system!(uncached_system)
+        end
         # Same build with the FEM condensation forced back in sequence with
         # the GPU assembly: the overlap must change the timing, not the algebra.
         sequential_system = withenv("BLAB_COUPLED_STAGE_OVERLAP" => "off") do
