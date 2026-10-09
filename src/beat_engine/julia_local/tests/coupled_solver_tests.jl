@@ -394,6 +394,8 @@ end
     )
 end
 
+include(joinpath(@__DIR__, "interface_projected_tests.jl"))
+
 @testset "empty FEM-BEM interface operators" begin
     fem_mesh = load_gmsh41_volume(joinpath(COUPLED_FIXTURE_ROOT, "femvolume.msh"), 0.001)
     bem_mesh = load_gmsh22_with_tags(joinpath(COUPLED_FIXTURE_ROOT, "exterior_conforming.msh"), 0.001)
@@ -1300,6 +1302,11 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
 
             @test cpu_system.linear_backend == :cpu
             @test metal_system.linear_backend == :cpu
+            @test eltype(metal_system.factorization) == ComplexF64
+            @test eltype(cpu_system.factorization) == ComplexF64
+            @test eltype(metal_solution.fem_pressure) == ComplexF32
+            @test eltype(metal_solution.bem_pressure) == ComplexF32
+            @test eltype(metal_solution.interface_flux) == ComplexF32
             @test metal_system.formulation == :monolithic
             @test condensed_system.linear_backend == :cpu
             @test condensed_system.bem_backend == :metal
@@ -1430,6 +1437,19 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
                     reference_voltage_solution.interface_flux,
                     metal_voltage_solution.interface_flux,
                 ) < voltage_flux_tolerance
+                # Check physical face flux and observable radiation as well as
+                # the projected vertex-indexed flux coefficients.
+                @test relative_error(reference_voltage_solution.bem_neumann,
+                    metal_voltage_solution.bem_neumann) < voltage_flux_tolerance
+                reference_points = SVector{3,Float64}[SVector(0.2, 0.13, 0.3), SVector(-0.27, 0.08, 0.24)]
+                metal_points = SVector{3,Float32}.(reference_points)
+                reference_field = evaluate_galerkin_field_cpu(reference_points, reference_bem_mesh,
+                    reference_voltage_solution.bem_pressure, reference_voltage_solution.bem_neumann,
+                    reference_system.wavenumber, reference_system.field_cache)
+                metal_field = evaluate_galerkin_field_metal(metal_points, bem_mesh,
+                    metal_voltage_solution.bem_pressure, metal_voltage_solution.bem_neumann,
+                    metal_system.wavenumber, metal_system.field_cache)
+                @test relative_error(reference_field, metal_field) < voltage_flux_tolerance
             finally
                 release_coupled_system!(reference_system)
             end

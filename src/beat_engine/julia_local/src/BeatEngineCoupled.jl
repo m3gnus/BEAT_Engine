@@ -845,16 +845,45 @@ function build_conforming_interface_map(
     )
 end
 
+"""Reject a projected DP0 transfer with unresolved nodal coefficient modes.
+
+The row-sum normalized, nonnegative Gram matrix has largest eigenvalue one.
+Checking its shift by `threshold*I` bounds the transfer condition number in
+dimensionless coordinates. This is a numerical lower-bound check, not a bound
+on the complete acoustic solution. Geometry alone does not ensure admissibility.
+"""
+function _validate_projected_interface_load(fem_load, interface_vertices, ::Type{T}) where {T<:AbstractFloat}
+    isempty(interface_vertices) && return nothing
+    gram = SparseMatrixCSC{Float64,Int}(fem_load[interface_vertices, :])
+    weights = vec(sum(gram; dims=2))
+    all(weight -> isfinite(weight) && weight > 0, weights) || error(
+        "Projected DP0 interface transfer has nonpositive or nonfinite nodal area weights.",
+    )
+    scaling = spdiagm(0 => inv.(sqrt.(weights)))
+    normalized = scaling * gram * scaling
+    threshold = max(sqrt(eps(Float64)), 1024 * Float64(eps(T)))
+    shifted = normalized - spdiagm(0 => fill(threshold, length(weights)))
+    factorization = cholesky(Symmetric(shifted); check=false)
+    issuccess(factorization) || error(
+        "Projected DP0 interface transfer is rank deficient or ill-conditioned " *
+        "at the $T precision threshold $threshold. Remesh the interface with an " *
+        "admissible triangulation or use a formulation with matching higher-order flux traces.",
+    )
+    return nothing
+end
+
+"""Use the same facewise DP0 flux in the FEM weak load and BEM radiation.
+
+The interface coefficients index FEM vertices, but parameterize projected DP0
+flux: each physical face value is the mean of its three coefficients. The exact
+P1 test load of that flux is area/9*ones(3,3), rather than the consistent P1/P1
+surface mass. Only this interface load changes; other boundary masses stay P1.
+"""
 function assemble_interface_operators(
     fem_mesh::VolumeMesh{T},
     bem_mesh::BoundaryMesh{T},
     interface_map::ConformingInterfaceMap,
 ) where {T<:AbstractFloat}
-    fem_load = assemble_boundary_mass_matrix(
-        fem_mesh,
-        interface_map.fem_face_indices,
-        interface_map.fem_vertex_indices,
-    )
     interface_dof = Dict(
         vertex => index
         for (index, vertex) in enumerate(interface_map.fem_vertex_indices)
@@ -863,10 +892,23 @@ function assemble_interface_operators(
     bem_flux_rows = Int[]
     bem_flux_cols = Int[]
     bem_flux_values = T[]
+    fem_load_rows = Int[]
+    fem_load_cols = Int[]
+    fem_load_values = T[]
     for local_face_index in eachindex(interface_map.fem_face_indices)
         fem_face = fem_mesh.boundary_faces[interface_map.fem_face_indices[local_face_index]]
         bem_face_index = interface_map.bem_face_indices[local_face_index]
         orientation = T(interface_map.normal_sign[local_face_index])
+        # FEM q uses its outward normal. BEM receives the oriented face mean;
+        # orientation signs cancel in the corresponding FEM weak-load Gram.
+        # Use the BEM area for exactly the same work pairing even when the
+        # conforming geometry matcher admits tiny coordinate differences.
+        projected_mass = bem_mesh.areas[bem_face_index] / T(9)
+        for row_vertex in fem_face, col_vertex in fem_face
+            push!(fem_load_rows, row_vertex)
+            push!(fem_load_cols, interface_dof[col_vertex])
+            push!(fem_load_values, projected_mass)
+        end
         for vertex in fem_face
             push!(bem_flux_rows, bem_face_index)
             push!(bem_flux_cols, interface_dof[vertex])
@@ -880,6 +922,11 @@ function assemble_interface_operators(
         length(bem_mesh.faces),
         length(interface_map.fem_vertex_indices),
     )
+    fem_load = sparse(
+        fem_load_rows, fem_load_cols, fem_load_values,
+        length(fem_mesh.vertices), length(interface_map.fem_vertex_indices),
+    )
+    _validate_projected_interface_load(fem_load, interface_map.fem_vertex_indices, T)
 
     interface_count = length(interface_map.fem_vertex_indices)
     fem_trace = sparse(
@@ -2508,7 +2555,12 @@ function build_coupled_system(
     block_assembly_s = (time_ns() - block_assembly_started) / 1.0e9
 
     coupled_factorization_started = time_ns()
-    factorization = if validation_diagnostics
+    factorization = if linear_backend == :cpu && bem_backend in (:cpu, :metal) && T == Float32
+        # Coupled pressure/flux/transducer blocks can be badly scaled. A host
+        # Float32 LU loses coefficient accuracy even when the assembled entries
+        # are adequate; keep the host solve in Float64 and cast only its traces.
+        lu!(ComplexF64.(coupled))
+    elseif validation_diagnostics
         lu(coupled)
     elseif linear_backend == :rocm
         rocm_dense_lu!(coupled)
@@ -2684,13 +2736,15 @@ function _coupled_solution_from_vector(
         length(system.bem_mesh.faces),
     ),
 )
+    T = system.scalar_type
+    trace(range) = convert(Vector{Complex{T}}, solution[range])
     return _coupled_solution_from_parts(
         system,
-        solution[system.fem_range],
-        solution[system.bem_range],
-        solution[system.flux_range];
-        diaphragm_velocity=solution[system.mechanical_range],
-        voice_coil_current=solution[system.electrical_range],
+        trace(system.fem_range),
+        trace(system.bem_range),
+        trace(system.flux_range);
+        diaphragm_velocity=trace(system.mechanical_range),
+        voice_coil_current=trace(system.electrical_range),
         prescribed_bem_neumann=prescribed_bem_neumann,
         solution=solution,
         rhs=rhs,
