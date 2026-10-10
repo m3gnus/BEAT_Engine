@@ -102,10 +102,10 @@ end
     request = bundle.JSON.parse(bundle.JSON.json(bundle.coupled_workload_request(; tiny=true)))
     @test bundle.BeatEngineContract.validate_system_request(request) === nothing
     fem = bundle.translated_volume_mesh(request["compiled_system"]["meshes"][2], Float64)
-    @test length(fem.vertices) == 5 && length(fem.tetrahedra) == 4
+    @test length(fem.vertices) == 11 && length(fem.tetrahedra) == 16
     topology = only(request["compiled_system"]["interfaces"])["topology"]
-    @test length(topology["fem_vertex_indices"]) == 3
-    @test length(topology["fem_face_indices"]) == 1
+    @test length(topology["fem_vertex_indices"]) == 6
+    @test length(topology["fem_face_indices"]) == 6
     @test length(request["outputs"]) == 4
     settings = bundle.coupled_workload_environment(; mumps=false)
     withenv(settings...) do

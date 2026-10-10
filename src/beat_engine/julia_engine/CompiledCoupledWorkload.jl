@@ -1,5 +1,5 @@
 # Shared compiled-contract workload. Full requests use the frozen, packaged
-# coupled fixtures; the CPU bundle/CI use a five-vertex analogue of that graph.
+# coupled fixtures; the CPU bundle/CI use a small analogue of that graph.
 function coupled_workload_mesh(id, name, file, purpose)
     return Dict{String,Any}("id" => id, "name" => name, "file" => file,
         "purpose" => purpose, "scale_to_m" => 0.001,
@@ -14,25 +14,61 @@ function coupled_workload_packed(values, dtype)
 end
 
 function tiny_coupled_workload_meshes()
-    # A tetrahedron split about its centroid leaves an actual FEM interior
-    # vertex even when the radiator vertices are retained. All faces point out.
-    points = Float64[0 0 0; 80 0 0; 0 80 0; 0 0 80; 20 20 20]
-    faces = Int64[0 2 1; 0 1 3; 1 2 3; 2 0 3]
-    tets = Int64[0 2 1 4; 0 1 3 4; 1 2 3 4; 2 0 3 4]
+    # An 80 mm cube split into tetrahedra about one interior vertex (so the FEM
+    # keeps an actual interior vertex even when the radiator vertices are
+    # retained). The bottom face is the interface, the top the radiator. The
+    # interface is a deliberately irregular six-vertex, six-triangle patch with
+    # two interior vertices: the projected DP0 interface transfer needs full
+    # column rank, which a single triangle, a fan or a regular (three-colourable)
+    # grid lacks. Boundary faces point out; each tetrahedron is (outward face, apex).
+    points = Float64[0 0 0; 80 0 0; 80 80 0; 0 80 0; 42 56 0; 42 23 0;
+                     0 0 80; 80 0 80; 80 80 80; 0 80 80; 40 40 40]
+    faces = Int64[2 1 4;
+                  3 2 4;
+                  4 0 3;
+                  1 0 5;
+                  5 0 4;
+                  4 1 5;
+                  6 7 8;
+                  6 8 9;
+                  0 1 7;
+                  0 7 6;
+                  1 2 8;
+                  1 8 7;
+                  2 3 9;
+                  2 9 8;
+                  3 0 6;
+                  3 6 9]
+    tets = Int64[2 1 4 10;
+                3 2 4 10;
+                4 0 3 10;
+                1 0 5 10;
+                5 0 4 10;
+                4 1 5 10;
+                6 7 8 10;
+                6 8 9 10;
+                0 1 7 10;
+                0 7 6 10;
+                1 2 8 10;
+                1 8 7 10;
+                2 3 9 10;
+                2 9 8 10;
+                3 0 6 10;
+                3 6 9 10]
     cell(kind, indices, tags) = Dict("type" => kind,
         "connectivity" => coupled_workload_packed(indices, "<i8"),
         "physical_tags" => coupled_workload_packed(tags, "<i8"))
     fem = coupled_workload_mesh("mesh:interior", "Interior", "", "fem_volume")
     fem["mesh_data"] = Dict("schema_version" => 1,
         "points" => coupled_workload_packed(points, "<f8"),
-        "cells" => [cell("triangle", faces, Int64[3, 2, 4, 4]),
-                    cell("tetra", tets, ones(Int64, 4))],
+        "cells" => [cell("triangle", faces, Int64[3, 3, 3, 3, 3, 3, 2, 2, 4, 4, 4, 4, 4, 4, 4, 4]),
+                    cell("tetra", tets, ones(Int64, 16))],
         "physical_names" => Dict("Volume" => [1, 3], "Radiator" => [2, 2],
                                  "Interface" => [3, 2], "Volume_boundary" => [4, 2]))
     bem = coupled_workload_mesh("mesh:exterior", "Exterior", "", "bem_surface")
     bem["mesh_data"] = Dict("schema_version" => 1,
-        "points" => coupled_workload_packed(points[1:4, :], "<f8"),
-        "cells" => [cell("triangle", faces, Int64[2, 1, 1, 1])],
+        "points" => coupled_workload_packed(points[1:10, :], "<f8"),
+        "cells" => [cell("triangle", faces, Int64[2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])],
         "physical_names" => Dict("ExteriorBox" => [1, 2], "Interface" => [2, 2]))
     return fem, bem
 end
@@ -103,7 +139,7 @@ function coupled_workload_request(; tiny::Bool=false, bem_backend::String="cpu")
                 "parameters" => Dict("bl_n_per_a" => 7.9, "cms_m_per_n" => 0.00086,
                     "le_h" => 0.00029, "mmd_kg" => 0.0397, "re_ohm" => 3.3,
                     "rms_n_s_per_m" => 1.25, "motion_profile" => "rigid_translation",
-                    "motion_axis" => (tiny ? [0.0, 1.0, 0.0] : [0.0, 0.0, 1.0]),
+                    "motion_axis" => [0.0, 0.0, 1.0],
                     "symmetry_role" => "complete_representative", "surface_completion_factor" => 1,
                     "physical_driver_orbit_count" => 1, "fractional_symmetry_axes" => []))],
             "excitation_ports" => [Dict("id" => "port:voltage", "name" => "Radiator voltage",
