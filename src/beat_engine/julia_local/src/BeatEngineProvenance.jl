@@ -14,7 +14,12 @@ file_hash(path) = path !== nothing && isfile(path) ? open(sha256, path) |> bytes
 # spawn in the first request, and on macOS without developer tools the stub
 # /usr/bin/git offers to install them.
 function inside_git_checkout(path=ENGINE_ROOT)
-    directory = abspath(path)
+    # Follow symlinks, as `git -C` does, so a linked engine still finds its checkout.
+    directory = try
+        realpath(path)
+    catch
+        abspath(path)
+    end
     while true
         ispath(joinpath(directory, ".git")) && return true
         parent = dirname(directory)
