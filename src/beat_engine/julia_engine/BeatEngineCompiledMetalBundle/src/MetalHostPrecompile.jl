@@ -111,7 +111,8 @@ function metal_host_signatures()
         core._metal_sparse_scatter_kernel!, core._metal_weighted_field_sources_kernel!,
         core._metal_field_eval_entries_kernel!, core._metal_field_eval_chunked_kernel!,
         core._metal_field_reduce_partials_kernel!, core._metal_fast_field_kernel!,
-        core._metal_fast_field_sources_kernel!, core._metal_fast_field_reduce_kernel!))
+        core._metal_fast_field_sources_kernel!, core._metal_fast_field_reduce_kernel!,
+        core._metal_fast_field_outputs_kernel!, core._metal_fast_field_outputs_reduce_kernel!))
     for (f, tt) in metal_kernel_signatures()
         f in launches || continue
         # fieldtypes expands fixed Vararg entries in the generated inventory.

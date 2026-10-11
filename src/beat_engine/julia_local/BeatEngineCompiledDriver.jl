@@ -1231,7 +1231,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                          max(1, process_blas_threads - 1) : process_blas_threads
     try
         if metal_field_batch !== nothing
-            metal_field_points = BeatEngineCore.prepare_metal_field_output_points(metal_field_batch.point_sets)
+            metal_field_points = BeatEngineCore.prepare_metal_field_output_points(
+                metal_field_batch.point_sets, field_cache.source_count)
         end
         if sweep_blas_threads != process_blas_threads
             BLAS.set_num_threads(sweep_blas_threads)

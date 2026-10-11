@@ -296,7 +296,7 @@ end
                 metal_batch = Driver.exterior_metal_field_output_batch(outputs, parsed, :metal)
                 point_sets = metal_batch.point_sets
                 @test length.(point_sets) == [1, 37, 2664, 37]
-                point_cache = Engine.prepare_metal_field_output_points(point_sets)
+                point_cache = Engine.prepare_metal_field_output_points(point_sets, cache.source_count)
                 uploaded_points = point_cache.device_points
                 @test point_cache.point_counts == [1, 37, 2664, 37]
                 @test length(uploaded_points) == 3 * (1 + 37 + 2664 + 37)
@@ -306,6 +306,24 @@ end
                           Engine._metal_field_chunk_count(2664, cache.source_count)
                 end
                 k = T(2pi * 3000 / 343)
+                @testset "one sources/field/reduce launch for all output blocks" begin
+                    pressure = ones(ComplexF32, length(mesh.vertices))
+                    neumann = ones(ComplexF32, length(mesh.faces))
+                    for chunks in ("auto", "1")
+                        observed = Any[]
+                        observe(job) = push!(observed, job.source.specTypes.parameters[1].instance)
+                        empty!(metal.kernel_instances)
+                        withenv("BLAB_METAL_FIELD_CHUNKS" => chunks) do
+                            Base.ScopedValues.with(metal.GPUCompiler.compile_hook => observe) do
+                                Engine.evaluate_galerkin_field_metal_outputs(
+                                    point_sets, pressure, neumann, k, cache; point_cache=point_cache)
+                            end
+                        end
+                        expected = Any[Engine._metal_fast_field_sources_kernel!, Engine._metal_fast_field_outputs_kernel!]
+                        chunks == "1" || push!(expected, Engine._metal_fast_field_outputs_reduce_kernel!)
+                        @test observed == expected
+                    end
+                end
                 for chunks in ("auto", "1", "4", string(cache.source_count + 1)), drive in 1:2,
                     convention in (Engine.NEGATIVE_TIME_PHASOR, Engine.POSITIVE_TIME_PHASOR)
                     pressure = ComplexF32[ComplexF32(sin(0.3i + drive), cos(0.7i - drive)) for i in eachindex(mesh.vertices)]
@@ -321,6 +339,8 @@ end
                                 retained = Engine.evaluate_galerkin_field_metal_outputs(
                                     point_sets, pressure, neumann, frequency_k, cache; point_cache=point_cache)
                                 @test point_cache.device_points === uploaded_points
+                                partition = Engine._metal_field_output_partition!(point_cache, cache.source_count)
+                                @test partition === Engine._metal_field_output_partition!(point_cache, cache.source_count)
                                 for (points, values) in zip(point_sets, retained)
                                     separate = Engine._evaluate_galerkin_field_metal_fast(
                                         points, pressure, neumann, Engine.outgoing_wavenumber(frequency_k), cache)
@@ -336,8 +356,9 @@ end
                             # Empty outputs do not shift neighbouring nonempty blocks.
                             empty_points = SVector{3,T}[]
                             mixed = Engine.evaluate_galerkin_field_metal_outputs(
-                                [empty_points, point_sets[1], empty_points], pressure, neumann, k, cache)
-                            @test isempty(mixed[1]) && isempty(mixed[3])
+                                [empty_points, point_sets[1], empty_points, point_sets[2], empty_points], pressure, neumann, k, cache)
+                            @test isempty(mixed[1]) && isempty(mixed[3]) && isempty(mixed[5])
+                            @test bits(mixed[4]) == bits(together[2])
                             @test bits(mixed[2]) == bits(together[1])
                             @test isempty(Engine.evaluate_galerkin_field_metal_outputs(
                                 Vector{SVector{3,T}}[], pressure, neumann, k, cache))
@@ -415,10 +436,14 @@ end
                             fill!(d_weights, Engine._metal_float4(NaN32, NaN32, NaN32, NaN32))
                             fill!(d_partials, ComplexF32(NaN32, NaN32))
                             fill!(d_potentials, ComplexF32(NaN32, NaN32))
-                            Engine._metal_fast_field_outputs!(d_potentials, d_partials, d_points, d_weights,
-                                d_pressure, d_neumann, counts, chunk_counts,
-                                Engine.outgoing_wavenumber(k), cache)
-                            metal.synchronize()
+                            partition = Engine._prepare_metal_field_output_partition(counts, chunk_counts, cache.source_count)
+                            try
+                                Engine._metal_fast_field_outputs!(d_potentials, d_partials, d_points, d_weights,
+                                    d_pressure, d_neumann, partition, Engine.outgoing_wavenumber(k), cache)
+                            finally
+                                metal.synchronize()
+                                metal.unsafe_free!(partition.device_table)
+                            end
                             host = Array(d_potentials)
                             active_partials = sum((n * c for (n, c) in zip(counts, chunk_counts) if c > 1); init=0)
                             if active_partials > 0

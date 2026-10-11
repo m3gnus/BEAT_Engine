@@ -79,6 +79,14 @@ end
     @test field_batch === nothing
     @test metal_batch !== nothing
     runtime = bundle.metal_runtime_signatures()
+    @test Tuple{typeof(core.prepare_metal_field_output_points), typeof(metal_batch.point_sets), Int} in runtime
+    @test Tuple{typeof(core._metal_field_output_partition!), core.MetalFieldOutputPoints, Int} in runtime
+    host = bundle.metal_host_signatures()
+    for (f, tt) in bundle.metal_kernel_signatures()
+        f in (core._metal_fast_field_outputs_kernel!, core._metal_fast_field_outputs_reduce_kernel!) || continue
+        @test any(signature -> signature[1] === Core.kwcall &&
+                  signature[2][2] === bundle.Metal.HostKernel{typeof(f),tt}, host)
+    end
     @test Tuple{typeof(Core.kwcall),
         NamedTuple{(:cpu_kernel, :metal_field_points), Tuple{Symbol, core.MetalFieldOutputPoints}},
         typeof(bundle.exterior_output_fields!), Dict{String,Any}, String, typeof(points_by_output),

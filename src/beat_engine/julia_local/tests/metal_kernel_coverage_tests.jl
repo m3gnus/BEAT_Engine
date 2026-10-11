@@ -38,6 +38,19 @@ function observed_metal_signatures()
                     request["outputs"][1]["options"]["points_m"] =
                         [[2sin(a), symmetry == "ground" ? 0.3 : 0.0, 2cos(a)]
                          for a in range(0, pi; length=37)]
+                    # Different point counts must share the batched field and
+                    # reducer specializations, with independent partitions.
+                    for (id, points) in (
+                        ("single", [[0.0, 0.0, 2.0]]),
+                        ("sphere", [[2sin(a) * cos(b), 2sin(a) * sin(b), 2cos(a)]
+                                    for a in range(0, pi; length=37)
+                                    for b in range(0, 2pi; length=73)[1:72]]),
+                    )
+                        output = deepcopy(request["outputs"][1])
+                        output["id"] = id
+                        output["options"]["points_m"] = points
+                        push!(request["outputs"], output)
+                    end
                     system = request["compiled_system"]
                     system["meshes"][1]["scale_to_m"] = scale
                     # The compiled ground contract rejects a face coplanar
@@ -89,6 +102,9 @@ end
     @test Metal.functional()
     observed = observed_metal_signatures()
     @test !isempty(observed)
+    core = Bundle.BeatEngineCore
+    @test any(signature -> signature[1] === core._metal_fast_field_outputs_kernel!, observed)
+    @test any(signature -> signature[1] === core._metal_fast_field_outputs_reduce_kernel!, observed)
     if "--generate" in ARGS
         path = joinpath(dirname(pathof(Bundle)), "MetalKernelSignatures.jl")
         write_metal_signatures(path, observed)

@@ -134,6 +134,101 @@ function _metal_fast_field_kernel!(
     return nothing
 end
 
+# Output-major work blocks retain each output's original point-major chunks.
+# Only address selection differs from _metal_fast_field_kernel!: the arithmetic
+# below, including the source loop and its fastmath boundaries, is unchanged.
+function _metal_fast_field_outputs_kernel!(
+    potentials, partials, eval_points, partitions, points4, normals4, weights4,
+    k::Float32, source_count::Int32, work_count::Int32,
+)
+    linear_index = Int32(thread_position_in_grid_1d())
+    linear_index > work_count && return nothing
+    output = Int32(1)
+    @inbounds while linear_index > partitions[output, 6] + partitions[output, 2] * partitions[output, 3]
+        output += Int32(1)
+    end
+    @inbounds begin
+        point_offset = partitions[output, 1]
+        point_count = partitions[output, 2]
+        chunk_count = partitions[output, 3]
+        chunk_length = partitions[output, 4]
+        partial_offset = partitions[output, 5]
+        local_index = linear_index - partitions[output, 6]
+    end
+    point_index = (local_index - Int32(1)) % point_count + Int32(1)
+    chunk_index = (local_index - Int32(1)) ÷ point_count
+    source_start = chunk_index * chunk_length + Int32(1)
+    source_stop = min(source_count, source_start + chunk_length - Int32(1))
+    inv_four_pi = 0.07957747154594767f0
+    @inbounds x1 = eval_points[Int32(3) * point_offset + point_index]
+    @inbounds x2 = eval_points[Int32(3) * point_offset + point_index + point_count]
+    @inbounds x3 = eval_points[Int32(3) * point_offset + point_index + Int32(2) * point_count]
+    potential_re = ntuple(_ -> 0.0f0, Val(1))
+    potential_im = ntuple(_ -> 0.0f0, Val(1))
+    s = source_start
+    while s <= source_stop
+        @inbounds sp = points4[s]
+        Base.@fastmath begin
+        r1 = sp[1].value - x1
+        r2 = sp[2].value - x2
+        r3 = sp[3].value - x3
+        radius2 = r1 * r1 + r2 * r2 + r3 * r3
+        if radius2 > 0.0f0
+            @inbounds sn = normals4[s]
+            radius = _metal_precise_sqrt(radius2)
+            inv_radius = 1.0f0 / radius
+            phase = k * radius
+            green_scale = inv_radius * inv_four_pi
+            c, sn_ = _metal_field_cis(phase)
+            green_re = c * green_scale
+            green_im = sn_ * green_scale
+            normal_projection = (r1 * sn[1].value + r2 * sn[2].value + r3 * sn[3].value) * inv_radius
+            double_re = (-green_re * inv_radius - green_im * k) * normal_projection
+            double_im = (green_re * k - green_im * inv_radius) * normal_projection
+            potential_re, potential_im = _metal_field_update(potential_re, potential_im, weights4, s, source_count,
+                double_re, double_im, green_re, green_im, Val(1))
+        end
+        end
+        s += Int32(1)
+    end
+    @inbounds if chunk_count == Int32(1)
+        potentials[point_offset + point_index] = Complex(potential_re[1], potential_im[1])
+    else
+        partials[partial_offset + local_index] = Complex(potential_re[1], potential_im[1])
+    end
+    return nothing
+end
+
+function _metal_fast_field_outputs_reduce_kernel!(potentials, partials, partitions, point_count::Int32)
+    index = Int32(thread_position_in_grid_1d())
+    index > point_count && return nothing
+    output = Int32(1)
+    @inbounds while index > partitions[output, 1] + partitions[output, 2]
+        output += Int32(1)
+    end
+    @inbounds begin
+        offset = partitions[output, 1]
+        count = partitions[output, 2]
+        chunks = partitions[output, 3]
+        base = partitions[output, 5]
+    end
+    # A one-chunk result was written directly by the field kernel. Adding it
+    # to +0 here would differ from the original path for a negative zero.
+    chunks == Int32(1) && return nothing
+    point_index = index - offset
+    total_re = 0.0f0
+    total_im = 0.0f0
+    chunk_index = Int32(0)
+    while chunk_index < chunks
+        @inbounds value = partials[base + point_index + chunk_index * count]
+        total_re += real(value)
+        total_im += imag(value)
+        chunk_index += Int32(1)
+    end
+    @inbounds potentials[index] = Complex(total_re, total_im)
+    return nothing
+end
+
 function _metal_fast_field_reduce_kernel!(potentials, partials, point_count::Int32, chunk_count::Int32, drive_count::Int32)
     index = Int32(thread_position_in_grid_1d())
     index > point_count * drive_count && return nothing
@@ -236,9 +331,46 @@ function _evaluate_galerkin_field_metal_fast(
     return result
 end
 
+# One table row per output: point offset/count, chunk count/length, partial
+# offset, and field-work offset. One-chunk outputs need no partial storage.
+struct MetalFieldOutputPartition
+    device_table
+    partial_count::Int
+    work_count::Int
+end
+
+function _prepare_metal_field_output_partition(point_counts, chunk_counts, source_count)
+    table = Matrix{Int32}(undef, length(point_counts), 6)
+    point_offset = partial_offset = work_offset = 0
+    for (output, (n, c)) in enumerate(zip(point_counts, chunk_counts))
+        table[output, :] = Int32[point_offset, n, c, cld(source_count, c), partial_offset, work_offset]
+        point_offset += n
+        c > 1 && (partial_offset += n * c)
+        work_offset += n * c
+    end
+    return MetalFieldOutputPartition(MtlArray(table), partial_offset, work_offset)
+end
+
+# Request-owned observation blocks and partition tables. Quadrature-specific
+# field caches may change per frequency, so partition tables are keyed by
+# source count and the chunk override, then reused for that request.
+struct MetalFieldOutputPoints
+    device_points
+    point_counts::Vector{Int}
+    partitions::Dict{Tuple{Int,String},MetalFieldOutputPartition}
+end
+
+function _metal_field_output_partition!(points::MetalFieldOutputPoints, source_count::Int)
+    key = (source_count, get(ENV, BEAT_METAL_FIELD_CHUNKS_ENV, "auto"))
+    return get!(points.partitions, key) do
+        chunks = [n == 0 ? 1 : _metal_field_chunk_count(n, source_count) for n in points.point_counts]
+        _prepare_metal_field_output_partition(points.point_counts, chunks, source_count)
+    end
+end
+
 # Enqueue only: callers own the buffers and wait before reading or freeing them.
 function _metal_fast_field_outputs!(d_potentials, d_partials, d_eval_points, d_weights4,
-                                    d_pressure, d_neumann, point_counts, chunk_counts,
+                                    d_pressure, d_neumann, partition::MetalFieldOutputPartition,
                                     k::Float32, cache::MetalFieldEvaluationCache{Float32})
     tables = _metal_fast_field_tables_for(cache)
     groupsize = 128
@@ -249,48 +381,28 @@ function _metal_fast_field_outputs!(d_potentials, d_partials, d_eval_points, d_w
         cache.basis_values, Int32(cache.source_count);
         groupsize=groupsize,
     )
-    point_offset = 0
-    partial_offset = 0
-    for (point_count, chunk_count) in zip(point_counts, chunk_counts)
-        point_count == 0 && continue
-        # Preserve the original n_i × 3 argument type as well as its linear layout.
-        points = reshape(view(d_eval_points, 3 * point_offset + 1:3 * (point_offset + point_count)), point_count, 3)
-        potentials = view(d_potentials, point_offset + 1:point_offset + point_count)
-        partials = chunk_count == 1 ? potentials :
-            view(d_partials, partial_offset + 1:partial_offset + point_count * chunk_count)
-        chunk_length = cld(cache.source_count, chunk_count)
+    _metal_launch(
+        _metal_fast_field_outputs_kernel!,
+        partition.work_count,
+        d_potentials, d_partials, d_eval_points, partition.device_table,
+        tables.points4, tables.normals4, d_weights4, k, Int32(cache.source_count), Int32(partition.work_count);
+        groupsize=groupsize,
+    )
+    if partition.partial_count > 0
         _metal_launch(
-            _metal_fast_field_kernel!,
-            point_count * chunk_count,
-            partials, points, tables.points4, tables.normals4, d_weights4, k,
-            Int32(cache.source_count), Int32(point_count), Int32(chunk_length), Int32(chunk_count), Val(1);
+            _metal_fast_field_outputs_reduce_kernel!,
+            length(d_potentials),
+            d_potentials, d_partials, partition.device_table, Int32(length(d_potentials));
             groupsize=groupsize,
         )
-        if chunk_count > 1
-            _metal_launch(
-                _metal_field_reduce_partials_kernel!,
-                point_count,
-                potentials, partials, point_count, chunk_count;
-                groupsize=groupsize,
-            )
-            partial_offset += point_count * chunk_count
-        end
-        point_offset += point_count
     end
     return nothing
-end
-
-# Request-owned observation blocks. Their lifetime is independent of the
-# quadrature-specific field caches a coupled sweep may select per frequency.
-struct MetalFieldOutputPoints
-    device_points
-    point_counts::Vector{Int}
 end
 
 function prepare_metal_field_output_points(point_sets)
     point_counts = [length(points) for points in point_sets]
     point_count = sum(point_counts)
-    point_count == 0 && return MetalFieldOutputPoints(nothing, point_counts)
+    point_count == 0 && return MetalFieldOutputPoints(nothing, point_counts, Dict{Tuple{Int,String},MetalFieldOutputPartition}())
     _require_metal!()
     # Each block is vec(n_i × 3), not a column of a concatenated n_total × 3 matrix.
     points = Vector{Float32}(undef, 3 * point_count)
@@ -302,7 +414,7 @@ function prepare_metal_field_output_points(point_sets)
     device_points = nothing
     try
         device_points = MtlArray(points)
-        return MetalFieldOutputPoints(device_points, point_counts)
+        return MetalFieldOutputPoints(device_points, point_counts, Dict{Tuple{Int,String},MetalFieldOutputPartition}())
     catch
         Metal.synchronize()
         device_points === nothing || Metal.unsafe_free!(device_points)
@@ -310,7 +422,26 @@ function prepare_metal_field_output_points(point_sets)
     end
 end
 
+# Exterior sweeps know their field quadrature at request setup. Coupled sweeps
+# can use the one-argument API and lazily prepare each selected source count.
+function prepare_metal_field_output_points(point_sets, source_count::Int)
+    points = prepare_metal_field_output_points(point_sets)
+    points.device_points === nothing && return points
+    try
+        _metal_field_output_partition!(points, source_count)
+        return points
+    catch
+        Metal.synchronize()
+        release_metal_field_output_points!(points)
+        rethrow()
+    end
+end
+
 function release_metal_field_output_points!(points::MetalFieldOutputPoints)
+    for partition in values(points.partitions)
+        Metal.unsafe_free!(partition.device_table)
+    end
+    empty!(points.partitions)
     points.device_points === nothing || Metal.unsafe_free!(points.device_points)
     return nothing
 end
@@ -318,12 +449,15 @@ end
 """
     evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k, cache; point_cache=nothing)
 
-Evaluate one Float32 excitation at several outputs with one sources pass and wait.
-Each output retains its own source partition and the single-drive kernels used by
+Evaluate one Float32 excitation at several outputs with one sources launch, one
+field launch, at most one reduction launch, and one wait. Each output retains
+its own source partition and the single-drive arithmetic used by
 `evaluate_galerkin_field_metal`, including the unreduced result when chunks == 1.
-Pass request-owned `prepare_metal_field_output_points(point_sets)` to reuse the
-unchanged observation blocks across frequencies; release it alongside the solve's
-field caches with `release_metal_field_output_points!` after evaluation completes.
+Pass request-owned `prepare_metal_field_output_points(point_sets, source_count)`
+to prepare observation blocks and partitions once before an exterior sweep. The
+one-argument form caches partitions lazily by source count and chunk override
+for changing coupled quadrature. Both forms reuse the blocks across frequencies;
+release it alongside the solve's field caches with `release_metal_field_output_points!` after evaluation completes.
 The `point_cache` is owned by one solve and matched by point counts only; callers must pass the cache built from the same point sets.
 """
 function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k::Float32,
@@ -335,7 +469,6 @@ function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k:
         throw(ArgumentError("Metal field point cache must match the output point blocks."))
     point_count == 0 && return [ComplexF32[] for _ in point_sets]
     _require_metal!()
-    chunk_counts = [n == 0 ? 1 : _metal_field_chunk_count(n, cache.source_count) for n in point_counts]
     pressure_on_device = pressure isa MtlArray
     neumann_on_device = neumann isa MtlArray
     owns_points = point_cache === nothing
@@ -343,16 +476,17 @@ function evaluate_galerkin_field_metal_outputs(point_sets, pressure, neumann, k:
     synchronized = false
     try
         owns_points && (point_cache = prepare_metal_field_output_points(point_sets))
+        partition = _metal_field_output_partition!(point_cache, cache.source_count)
         d_pressure = pressure_on_device ? pressure : MtlArray(ComplexF32.(pressure))
         d_neumann = neumann_on_device ? neumann : MtlArray(ComplexF32.(neumann))
         d_weights4 = MtlArray{_MetalFloat4}(undef, cache.source_count)
-        partial_count = sum((n * c for (n, c) in zip(point_counts, chunk_counts) if c > 1); init=0)
+        partial_count = partition.partial_count
         # The fast kernel writes every partial, even for empty source chunks; the
-        # same kernel (chunks == 1) or the original reducer writes every potential.
+        # field kernel (chunks == 1) or the batched reducer writes every potential.
         d_partials = MtlArray{ComplexF32}(undef, partial_count)
         d_potentials = MtlArray{ComplexF32}(undef, point_count)
         _metal_fast_field_outputs!(d_potentials, d_partials, point_cache.device_points, d_weights4,
-            d_pressure, d_neumann, point_counts, chunk_counts, k, cache)
+            d_pressure, d_neumann, partition, k, cache)
         Metal.synchronize()
         synchronized = true
         host = Array(d_potentials)

@@ -85,6 +85,19 @@ function metal_runtime_signatures()
         Tuple{typeof(Base.append!), Array{Any, 1}, Tuple{Metal.var"#broadcast_2d#_copyto!##2", Tuple{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Base.Broadcast.Broadcasted{Metal.MtlArrayStyle{2, Metal.SharedStorage}, Tuple{Base.OneTo{Int64}, Base.OneTo{Int64}}, typeof(Base.:(+)), Tuple{Base.Broadcast.Extruded{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Tuple{Bool, Bool}, Tuple{Int64, Int64}}, Base.Broadcast.Extruded{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.PrivateStorage}, Tuple{Bool, Bool}, Tuple{Int64, Int64}}}}}}},
         Tuple{typeof(Base.put!), Base.Channel{Tuple{Int64, Any}}, Tuple{Int64, NamedTuple{(:system, :k, :assembly_s), Tuple{NamedTuple{(:matrix, :rhs, :regular_pairs, :singular_pairs, :image_singular_pairs, :drive_count, :on_gpu, :gpu_backend, :assembly_mode), Tuple{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Int64, Int64, Int64, Int64, Bool, Symbol, Symbol}}, Float32, Float64}}}},
         Tuple{typeof(Base.getproperty), NamedTuple{(:system, :k, :assembly_s), Tuple{NamedTuple{(:matrix, :rhs, :regular_pairs, :singular_pairs, :image_singular_pairs, :drive_count, :on_gpu, :gpu_backend, :assembly_mode), Tuple{Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Metal.MtlArray{Base.Complex{Float32}, 2, Metal.SharedStorage}, Int64, Int64, Int64, Int64, Bool, Symbol, Symbol}}, Float32, Float64}}, Symbol},
+        # Request partition preparation and the enqueue call are reached via
+        # untyped cache buffers; compile their concrete host specializations.
+        Tuple{typeof(core.prepare_metal_field_output_points), Vector{points}, Int},
+        Tuple{typeof(core._metal_field_output_partition!), core.MetalFieldOutputPoints, Int},
+        Tuple{typeof(core._prepare_metal_field_output_partition), Vector{Int}, Vector{Int}, Int},
+        Tuple{typeof(core._metal_fast_field_outputs!),
+            Metal.MtlArray{ComplexF32,1,Metal.PrivateStorage},
+            Metal.MtlArray{ComplexF32,1,Metal.PrivateStorage},
+            Metal.MtlArray{Float32,1,Metal.PrivateStorage},
+            Metal.MtlArray{core._MetalFloat4,1,Metal.PrivateStorage},
+            Metal.MtlArray{ComplexF32,1,Metal.PrivateStorage},
+            Metal.MtlArray{ComplexF32,1,Metal.PrivateStorage},
+            core.MetalFieldOutputPartition, Float32, core.MetalFieldEvaluationCache{Float32}},
         # Exact warm exterior Metal calls: no CPU batch, solve-owned point cache,
         # host Float32 traces, and the same keyword order as the driver.
         Tuple{typeof(Core.kwcall),
