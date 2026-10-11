@@ -82,7 +82,7 @@ end
             fake_bin = joinpath(directory, "fake-bin")
             marker = joinpath(directory, "git-was-called")
             mkpath(fake_bin)
-            write(joinpath(fake_bin, "git"), "#!/bin/sh\ntouch '$marker'\nexit 1\n")
+            write(joinpath(fake_bin, "git"), "#!/bin/sh\n: > '$marker'\nexit 1\n")
             chmod(joinpath(fake_bin, "git"), 0o755)
             third_module = Module(:ThirdProvenanceFixture)
             Base.include(third_module, joinpath(fixture_root, "src", "BeatEngineProvenance.jl"))
