@@ -76,6 +76,10 @@ end
         Base.include(second_module, joinpath(fixture_root, "src", "BeatEngineProvenance.jl"))
         second = Base.invokelatest(() -> second_module.BeatEngineProvenance.engine_identity())
         @test second["source_sha256"] != first["source_sha256"]
+        # Outside any checkout the identity never asks Git.
+        @test !Base.invokelatest(() -> second_module.BeatEngineProvenance.inside_git_checkout())
+        mkpath(joinpath(directory, ".git"))
+        @test Base.invokelatest(() -> second_module.BeatEngineProvenance.inside_git_checkout())
     end
 end
 
