@@ -1,6 +1,7 @@
 include(joinpath(@__DIR__, "deploy_cpu_tests.jl"))
 include(joinpath(@__DIR__, "compiled_workload_tests.jl"))
 include(joinpath(@__DIR__, "compiled_driver_closure_tests.jl"))
+include(joinpath(@__DIR__, "speaker_rom_retained_layout_tests.jl"))
 include(joinpath(@__DIR__, "field_output_points_tests.jl"))
 include(joinpath(@__DIR__, "field_output_batch_tests.jl"))
 include(joinpath(@__DIR__, "regular_quadrature_default_tests.jl"))
@@ -45,6 +46,10 @@ rocm_available() = AMDGPU_MODULE !== nothing &&
                    AMDGPU_MODULE.functional() &&
                    AMDGPU_MODULE.functional(:rocblas) &&
                    AMDGPU_MODULE.functional(:rocsolver)
+
+if rocm_available()
+    include(joinpath(@__DIR__, "rocm_ground_tests.jl"))
+end
 
 const METAL_MODULE = try
     @eval import Metal
@@ -1846,9 +1851,12 @@ end
 
 if cuda_available()
     include(joinpath(@__DIR__, "coupled_bem_cuda_tests.jl"))
+    include(joinpath(@__DIR__, "cuda_interface_radiation_tests.jl"))
 end
 
 include(joinpath(@__DIR__, "interface_velocity_tests.jl"))
 
+include(joinpath(@__DIR__, "thermoviscous_tests.jl"))
+include(joinpath(@__DIR__, "thermoviscous_driver_tests.jl"))
 # Required standalone thin-air qualification: exterior_coupled_agreement_tests.jl.
 # Its runtime exceeds the default-suite budget; see docs/ExteriorCoupledQualification.md.

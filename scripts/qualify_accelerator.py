@@ -33,8 +33,43 @@ subprocess.run(
     env=environment,
     check=True,
 )
+if backend == "rocm":
+    for test in (
+        "rocm_phasor_tests.jl",
+        "rocm_worker_phasor_tests.jl",
+        "rocm_field_gradient_tests.jl",
+        "rocm_field_gradient_worker_tests.jl",
+        "rocm_near_correction_tests.jl",
+        "rocm_near_source_tests.jl",
+        "rocm_wavelength_tests.jl",
+        "rocm_wavelength_source_tests.jl",
+        "rocm_exterior_transducer_tests.jl",
+        "rocm_interface_radiation_tests.jl",
+        "rocm_transducer_condensation_tests.jl",
+        "rocm_transducer_condensation_worker_tests.jl",
+        "rocm_speaker_rank_tests.jl",
+        "rocm_speaker_rom_export_tests.jl",
+        "deploy_rocm_tests.jl",
+        "rocm_thermoviscous_tests.jl",
+    ):
+        subprocess.run(
+            [
+                "julia",
+                "--threads=2",
+                "--startup-file=no",
+                f"--project={paths.project}",
+                str(paths.root / "julia_local/tests" / test),
+            ],
+            env=environment,
+            check=True,
+        )
 if backend == "metal":
-    for test in ("metal_host_tests.jl", "metal_kernel_coverage_tests.jl"):
+    for test in (
+        "metal_host_tests.jl",
+        "metal_near_correction_tests.jl",
+        "metal_kernel_coverage_tests.jl",
+        "metal_coupled_precompile_coverage_tests.jl",
+    ):
         subprocess.run(
             [
                 "julia",

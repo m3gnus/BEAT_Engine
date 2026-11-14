@@ -56,13 +56,21 @@ def validate_worker_ready(info: dict) -> None:
             isinstance(kinds, list) and all(isinstance(kind, str) and bool(kind.strip()) for kind in kinds),
             "invalid exterior_component_kinds capabilities; expected a list of non-empty strings.",
         )
-    if "exterior_source_profiles" in info:
-        profiles = info["exterior_source_profiles"]
-        _require(
-            isinstance(profiles, list)
-            and all(isinstance(profile, str) and bool(profile.strip()) for profile in profiles),
-            "invalid exterior_source_profiles capabilities; expected a list of non-empty strings.",
-        )
+    for name in ("exterior_source_profiles", "coupled_exterior_source_profiles"):
+        if name in info:
+            profiles = info[name]
+            _require(
+                isinstance(profiles, list)
+                and all(isinstance(profile, str) and bool(profile.strip()) for profile in profiles),
+                f"invalid {name} capabilities; expected a list of non-empty strings.",
+            )
+    for name in ("fem_wall_loss_models", "fem_wall_loss_scopes"):
+        if name in info:
+            values = info[name]
+            _require(
+                isinstance(values, list) and all(isinstance(value, str) and bool(value.strip()) for value in values),
+                f"invalid {name} capabilities; expected a list of non-empty strings.",
+            )
     if "optional_output_quantities" in info:
         quantities = info["optional_output_quantities"]
         _require(
@@ -111,6 +119,17 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
                 "radiation_impedance_matrix" in info.get("optional_output_quantities", []),
                 "radiation_impedance_matrix output is unavailable; update BEAT Engine.",
             )
+        for boundary in request["compiled_system"]["boundaries"]:
+            model = boundary["parameters"].get("thermoviscous_wall_losses", "off")
+            if model != "off":
+                _require(
+                    "boundary" in info.get("fem_wall_loss_scopes", []),
+                    "thermoviscous wall loss model requires boundary assignment support; update BEAT Engine.",
+                )
+                _require(
+                    model in info.get("fem_wall_loss_models", []),
+                    f"thermoviscous wall loss model {model!r} is unavailable; update BEAT Engine.",
+                )
         options = request["solver_options"]
         kinds = {region["kind"] for region in request["compiled_system"]["regions"]}
         kind = (
@@ -131,10 +150,23 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
                 continue
             profile = component["parameters"].get("motion_profile", "uniform_normal")
             if profile != "uniform_normal":
-                _require(kind == "exterior_bem", "rigid-translation ideal sources require an exterior BEM solve.")
+                system = request["compiled_system"]
+                exterior_ids = {region["id"] for region in system["regions"] if region["kind"] == "unbounded_air"}
+                boundaries = {boundary["id"]: boundary for boundary in system["boundaries"]}
                 _require(
-                    profile in info.get("exterior_source_profiles", ["uniform_normal"]),
-                    f"exterior source profile {profile!r} is unavailable; update the engine worker.",
+                    bool(component["boundary_ids"])
+                    and all(
+                        boundaries[boundary_id]["region_id"] in exterior_ids
+                        for boundary_id in component["boundary_ids"]
+                    ),
+                    "rigid-translation ideal sources require exterior-only boundary assignments.",
+                )
+                capability = (
+                    "coupled_exterior_source_profiles" if kind == "coupled_fem_bem_lem" else "exterior_source_profiles"
+                )
+                _require(
+                    profile in info.get(capability, ["uniform_normal"]),
+                    f"{kind} exterior source profile {profile!r} is unavailable; update BEAT Engine and restart the worker.",
                 )
         if "cancel_path" in request:
             _require(info.get("cancellation") == "marker_file", "marker-file cancellation is unavailable.")
@@ -152,6 +184,16 @@ def negotiate_submission(info: dict, request: dict, operation: str) -> dict:
         options = request
         default_precision = "float32"
         backend_name = str(options.get("bem_backend", "cpu")).lower()
+        quantity = request.get("field_quantity", "pressure")
+        if quantity != "pressure":
+            capabilities = info.get("field_quantities", {})
+            _require(isinstance(capabilities, dict), "invalid field_quantities announcement")
+            quantities = capabilities.get(backend_name, [])
+            _require(isinstance(quantities, list), "invalid field_quantities announcement")
+            _require(
+                quantity in quantities,
+                f"field quantity {quantity!r} is unavailable on {backend_name}; update the engine worker.",
+            )
     else:
         raise WorkerCompatibilityError(f"Unsupported client operation: {operation}")
     precision = str(options.get("precision", default_precision)).lower()

@@ -24,6 +24,7 @@ import array
 import base64
 import ctypes
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -34,22 +35,68 @@ from pathlib import Path
 from beat_engine import EngineWorker, engine_paths
 
 DEFAULT_FREQUENCIES = [20.0 * 1000.0 ** (i / 11) for i in range(12)]  # 12 log-spaced, 20 Hz - 20 kHz
+MEMORY_POLL_INTERVAL_S = 0.02
+
+
+def windows_working_set_reader(pid):
+    """Read current resident host bytes; neither lifetime peak nor GPU VRAM."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32)] + [
+            (name, ctypes.c_size_t)
+            for name in (
+                "PeakWorkingSetSize",
+                "WorkingSetSize",
+                "QuotaPeakPagedPoolUsage",
+                "QuotaPagedPoolUsage",
+                "QuotaPeakNonPagedPoolUsage",
+                "QuotaNonPagedPoolUsage",
+                "PagefileUsage",
+                "PeakPagefileUsage",
+            )
+        ]
+
+    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.K32GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(MemoryCounters), ctypes.c_uint32]
+    kernel.K32GetProcessMemoryInfo.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+
+    def read():
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            counters = MemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            if not kernel.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                return None
+            return counters.WorkingSetSize
+        finally:
+            kernel.CloseHandle(handle)
+
+    return read
 
 
 class PeakMemory:
     """Peak memory of one process, polled from a thread.
 
     macOS: phys_footprint, which includes Metal buffers in unified memory (RSS
-    does not). Linux: VmRSS. Elsewhere: not measured.
+    does not). Linux: VmRSS. Windows: current process working set (host RAM,
+    not dedicated GPU memory). Peaks are sampled within the sweep, not lifetime.
     """
 
-    def __init__(self, pid: int, interval_s: float = 0.02):
+    def __init__(self, pid: int, interval_s: float = MEMORY_POLL_INTERVAL_S):
         self.pid, self.interval_s, self.peak = pid, interval_s, None
         self._read = self._reader()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
     def _reader(self):
+        if sys.platform == "win32":
+            return windows_working_set_reader(self.pid)
         if sys.platform == "darwin":
             libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
 
@@ -123,14 +170,27 @@ def system_request(path: Path, backend: str, precision: str, frequencies):
     return request
 
 
-def outputs_of(result) -> dict:
-    """Complex outputs as {name@freq: [base64 complex128 little-endian, shape]}."""
-    freq = float(result["freq_hz"])
+def outputs_of(result, *, requested_frequency=None, frequency_index=0) -> dict:
+    """Complex outputs keyed by quantity, output ID, sweep index and frequency."""
+    actual_frequency = float(result["freq_hz"])
+    freq = actual_frequency if requested_frequency is None else float(requested_frequency)
+    # Workers may report a Float32 frequency. Preserve the requested Float64
+    # identity while checking that the returned row belongs to this sweep slot.
+    if (
+        not math.isfinite(freq)
+        or not math.isfinite(actual_frequency)
+        or not math.isclose(actual_frequency, freq, rel_tol=2e-6, abs_tol=1e-5)
+    ):
+        raise ValueError("Returned frequency does not match the requested sweep slot")
     found = {}
     for q in result.get("quantities", []):  # compiled-system results
         values = q.get("values")
-        if isinstance(values, dict) and "content_base64" in values:
-            found[q["quantity"]] = values
+        if not isinstance(values, dict) or "content_base64" not in values:
+            raise ValueError(f"Invalid benchmark output values: {q.get('id')}")
+        name = f"{q['quantity']}:{q['id']}"
+        if name in found:
+            raise ValueError(f"Duplicate benchmark output: {name}")
+        found[name] = values
     for key in ("horizontal_pressure", "vertical_pressure"):  # source-request results
         if isinstance(result.get(key), dict):
             found[key] = result[key]
@@ -149,7 +209,7 @@ def outputs_of(result) -> dict:
                     floats.extend((re, im))
             raw = floats.tobytes()
             shape = [len(rows_re), len(rows_re[0]) if rows_re else 0]
-        packed[f"{name}@{freq:.3f}"] = [base64.b64encode(raw).decode(), shape]
+        packed[f"{name}@{frequency_index}:{freq!r}"] = [base64.b64encode(raw).decode(), shape]
     return packed
 
 
@@ -235,17 +295,18 @@ def main():
 
 def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, before_mb, peak_mb):
     frequencies, outputs = [], {}
-    for result in rows:
+    for index, (result, requested_frequency) in enumerate(zip(rows, args.frequencies, strict=True)):
         diagnostics = result.get("diagnostics") or {}
         timings = result.get("timings") or diagnostics.get("timings") or {}
         frequencies.append(
             {
                 "freq_hz": float(result["freq_hz"]),
+                "requested_freq_hz": float(requested_frequency),
                 "timings": {k: v for k, v in timings.items() if isinstance(v, (int, float))},
                 "diagnostics": {k: v for k, v in diagnostics.items() if isinstance(v, (int, float, str, bool))},
             }
         )
-        outputs.update(outputs_of(result))
+        outputs.update(outputs_of(result, requested_frequency=requested_frequency, frequency_index=index))
     record = {
         "label": args.label,
         "commit": commit,
@@ -259,8 +320,18 @@ def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, befo
         "repeat_in_worker": repeat,
         "wall_s": wall_s,
         "memory_mb": {"before_sweep": before_mb, "peak_sweep": peak_mb},
+        "memory_measurement": {
+            "metric": {"win32": "working_set", "linux": "resident_set", "darwin": "phys_footprint"}.get(
+                sys.platform, "unavailable"
+            ),
+            "scope": "worker_process",
+            "peak_kind": "sampled_within_sweep",
+            "poll_interval_s": MEMORY_POLL_INTERVAL_S,
+            "dedicated_gpu_memory": "not_measured",
+        },
         "frequencies": frequencies,
         "outputs": outputs,
+        "output_key_version": 2,
     }
     out.write_text(json.dumps(record))
     totals = {}

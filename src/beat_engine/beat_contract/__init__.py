@@ -218,12 +218,24 @@ def _graph(system: dict) -> None:
         collections[key] for key in ("meshes", "regions", "boundaries", "components")
     )
     for region in regions.values():
+        if "thermoviscous_wall_losses" in region["loss_model"]:
+            _fail(f"region {region['id']}.loss_model", "assign thermoviscous wall losses to boundary parameters")
         _references(region["mesh_ids"], meshes, f"region {region['id']}.mesh_ids")
         for group in region["volume_groups"]:
             if group["mesh_id"] not in region["mesh_ids"] or group["dimension"] != 3:
                 _fail(f"region {region['id']}.volume_groups", "must reference a volume group on a region mesh")
     for boundary in boundaries.values():
         _references([boundary["region_id"]], regions, f"boundary {boundary['id']}.region_id")
+        if boundary["parameters"].get("thermoviscous_wall_losses", "off") != "off" and (
+            regions[boundary["region_id"]]["kind"] != "bounded_air"
+            or boundary["kind"] != "rigid"
+            or "wall_impedance" in boundary["parameters"]
+            or any(boundary["id"] in c["boundary_ids"] for c in components.values())
+        ):
+            _fail(
+                f"boundary {boundary['id']}.parameters",
+                "thermoviscous wall losses require an unlined, stationary rigid wall in bounded air",
+            )
         group = boundary["group"]
         if group["mesh_id"] not in regions[boundary["region_id"]]["mesh_ids"] or group["dimension"] != 2:
             _fail(f"boundary {boundary['id']}.group", "must reference a surface group on a region mesh")

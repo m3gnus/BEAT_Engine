@@ -23,6 +23,11 @@ import json
 import os
 import sys
 
+console_window = 0
+if os.name == "nt":
+    import ctypes
+    console_window = ctypes.windll.kernel32.GetConsoleWindow()
+
 print(json.dumps({"type": "ready"}), flush=True)
 for line in sys.stdin:
     submission = json.loads(line)
@@ -43,7 +48,7 @@ for line in sys.stdin:
     print("worker progress", flush=True)
     print(json.dumps({"type": "result", "payload": payload, "operation": operation,
                       "pid": os.getpid(), "threads": os.environ["JULIA_NUM_THREADS"],
-                      "sdk": os.environ.get("TEST_SDK")}), flush=True)
+                      "sdk": os.environ.get("TEST_SDK"), "console_window": console_window}), flush=True)
     print(json.dumps({"type": "completed"}), flush=True)
 """,
         encoding="utf-8",
@@ -73,6 +78,7 @@ def test_worker_streams_opaque_requests_and_reuses_process(worker_script, tmp_pa
         field = result(worker, request, "bem_field")
         assert first["payload"] == field["payload"] == payload
         assert first["pid"] == field["pid"]
+        assert first["console_window"] == field["console_window"] == 0
         assert first["threads"] == "2"
         assert first["sdk"] == "first"
         assert field["operation"] == "bem_field"

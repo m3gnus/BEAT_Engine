@@ -76,10 +76,31 @@ comparisons. See its [coverage notes](src/beat_engine/julia_local/tests/README.m
 The manual Accelerator qualification workflow uses self-hosted runners labeled
 `cuda`, `rocm`, or `metal`, with Python, Julia, and the matching SDK preinstalled. It requires
 the requested backend to be functional before running the numerical gates.
+ROCm qualification also checks interface-radiation replay against a monolithic
+CPU reference for both precisions and phasor conventions. It verifies complex
+excitations, partition ordering, zero input, direct exterior-source remainders,
+and reconstruction of boundary traces and observation fields for monolithic
+and condensed ROCm solves. Replay uses the shared host factorization; the
+coupled solve and observation-field evaluation use ROCm.
 GPU qualification remains hardware-specific; CPU success does not qualify GPU
 backends. Some historical research scripts and the optional noncubic-cavity test
 still require Boundary Lab's extended fixtures; they are not installed runtime
 requirements or part of the portable release gate.
+
+The speaker ROM rank experiment accepts ROCm FEM-interface-condensed systems.
+It copies the retained Schur block to the host and uses CPU LU for rank analysis;
+`interior_factorization_backend` reports this separately from the coupled backend.
+The hardware gate compares all four parity sectors on four reflected cavities,
+in both precisions and phasor conventions, against CPU condensation with interface
+elimination explicitly disabled. It does not qualify exported ROM artifacts or
+claim faster rank analysis.
+
+The ROCm ROM export gate reconstructs physical responses from the exported
+Petrov-Galerkin matrices, including direct affine terms and padded sector states.
+It compares boundary flux, diaphragm velocity, and voice-coil current with full
+interior solves and CPU exports for complex voltage and exterior-velocity drives.
+This checks numerical ROM contents; serialized package and Deploy execution
+qualification are separate.
 
 Exterior-only compiled-system CUDA and Metal solves default to direct
 Burton–Miller assembly. CUDA uses the same assembler as Deploy; Metal uses its
@@ -98,7 +119,7 @@ diagnostics. Coupled Metal solves assemble the four operators on the GPU and run
 the coupled algebra, including FEM static condensation, on the host. Register caps are explicit hardware tuning options; the compiler
 default is preserved. See [coupled CUDA architecture and controls](docs/Coupled%20CUDA%20Assembly.md).
 
-The package version is `0.1.4`. CI builds a wheel after independent
+The package version is `0.4.0`. CI builds a wheel after independent
 Python and CPU checks on Windows, Linux, and macOS. The manually dispatched release
 workflow requires a successful CI run for the tag's exact commit before attaching
 wheel/sdist artifacts to a stable GitHub release. No PyPI publication is configured.

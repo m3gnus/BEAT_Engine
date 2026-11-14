@@ -981,6 +981,16 @@ if get(ENV, "BLAB_RUN_COUPLED_ROCM", "0") == "1" && rocm_available()
             @test rocm_system.formulation == :monolithic
             @test condensed_system.linear_backend == :rocm
             @test condensed_system.formulation == :fem_interface_condensed
+            for gpu_system in (rocm_system, condensed_system)
+                @test eltype(gpu_system.factorization) == ComplexF64
+                @test gpu_system.factorization.factors isa BeatEngineCore.amdgpu_module().ROCArray
+            end
+            for gpu_solution in (rocm_solution, condensed_solution, rocm_voltage_solution, condensed_voltage_solution)
+                for key in (:fem_pressure, :bem_pressure, :interface_flux, :bem_neumann, :diaphragm_velocity, :voice_coil_current)
+                    @test eltype(getproperty(gpu_solution, key)) == ComplexF32
+                end
+            end
+            @info "ROCm coupled voltage flux precision" monolithic_vs_cpu=relative_error(cpu_voltage_solution.interface_flux, rocm_voltage_solution.interface_flux) condensed_vs_monolithic=relative_error(rocm_voltage_solution.interface_flux, condensed_voltage_solution.interface_flux)
             @test condensed_system.solved_system_order < condensed_system.full_system_order
             @test condensed_system.condensation.schur_block_size > 0
             @test 1 <= condensed_system.condensation.schur_thread_count <= Threads.nthreads()
@@ -1311,13 +1321,22 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             @test condensed_system.linear_backend == :cpu
             @test condensed_system.bem_backend == :metal
             @test condensed_system.formulation == :fem_interface_condensed
-            @test condensed_system.condensation.backend == :cpu_umfpack
+            @test condensed_system.condensation.backend in (:cpu_umfpack, :mumps_seq)
             @test condensed_system.timings.stage_overlap == (Threads.nthreads() > 1)
             @test sequential_system.timings.stage_overlap == false
             @test sequential_system.condensation.schur == condensed_system.condensation.schur
             @test condensed_system.solved_system_order < condensed_system.full_system_order
-            @test condensed_system.condensation.schur_block_size > 0
-            @test 1 <= condensed_system.condensation.schur_thread_count <= Threads.nthreads()
+            if condensed_system.condensation.backend == :mumps_seq
+                # Metal's packaged environment can select MUMPS automatically.
+                # Its Schur factorization is not blocked like UMFPACK, and its
+                # native thread pool is independent of Julia's thread count.
+                @test condensed_system.condensation.schur_block_size == 0
+                @test condensed_system.condensation.schur_thread_count ==
+                    BeatEngineCoupledCondensed.mumps_threads()
+            else
+                @test condensed_system.condensation.schur_block_size > 0
+                @test 1 <= condensed_system.condensation.schur_thread_count <= Threads.nthreads()
+            end
             @test metal_system.bulk_loss_factor == 0.01f0
             @test relative_error(cpu_solution.fem_pressure, metal_solution.fem_pressure) < 5e-4
             @test relative_error(cpu_solution.bem_pressure, metal_solution.bem_pressure) < 5e-4

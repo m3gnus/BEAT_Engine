@@ -57,16 +57,7 @@ else
     end
 end
 
-const METAL_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "rocm", "none")
-    nothing
-else
-    try
-        @eval import Metal
-        Metal
-    catch
-        nothing
-    end
-end
+const METAL_MODULE = include("BeatEngineMetalLoad.jl")
 
 export BoundaryMesh,
     combine_boundary_meshes,
@@ -1272,13 +1263,12 @@ function assemble_regular_galerkin_operators(
         )
     end
 
-    # These backends do not consume near-correction caches. Reject them before
-    # dispatch, including device-only caches, rather than silently ignoring them.
-    if backend in (:rocm, :metal) && any(cache -> cache !== nothing, (
-        near_correction_cache, image_near_correction_cache,
+    # ROCm builds difference rules from the host cache and the current regular
+    # rule; CUDA-specific device caches cannot be consumed by that path.
+    if backend == :rocm && any(cache -> cache !== nothing, (
         device_near_correction_cache, device_image_near_correction_cache,
     ))
-        error("Near-singular correction is not implemented for the $(backend) backend.")
+        error("ROCm near-singular correction requires host correction caches.")
     end
     if backend == :cuda && (
         near_correction_cache isa Union{Tuple,AbstractVector} ||
@@ -1330,12 +1320,16 @@ function assemble_regular_galerkin_operators(
             timing=timing,
             singular_cache=singular_cache,
             rocm_singular_cache=device_singular_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             assembly_mode=rocm_assembly_mode,
             symmetry_mode=symmetry_mode,
         )
     end
 
     if backend == :metal
+        (device_near_correction_cache === nothing && device_image_near_correction_cache === nothing) ||
+            error("Metal near-singular correction requires host correction caches.")
         accelerator_quadrature || error("Metal regular assembly requires accelerator_quadrature=true.")
         return assemble_regular_galerkin_operators_metal_regular(
             mesh,
@@ -1352,6 +1346,8 @@ function assemble_regular_galerkin_operators(
             timing=timing,
             singular_cache=singular_cache,
             metal_singular_cache=device_singular_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             assembly_mode=metal_assembly_mode,
             symmetry_mode=symmetry_mode,
         )
@@ -1813,6 +1809,7 @@ function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{
     )
 end
 
+include(joinpath(@__DIR__, "BeatEngineFieldGradient.jl"))
 include(joinpath(@__DIR__, "BeatEngineDenseSolve.jl"))
 include(joinpath(@__DIR__, "BeatEngineSweepOverlap.jl"))
 include(joinpath(@__DIR__, "BeatEngineCpu.jl"))

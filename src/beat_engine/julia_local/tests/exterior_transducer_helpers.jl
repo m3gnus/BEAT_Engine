@@ -11,7 +11,7 @@ function mesh_file(io,mesh)
     flush(io)
 end
 
-function driver_request(file; tags=[2], ideal=false)
+function driver_request(file; tags=[2], ideal=false, backend=get(ENV, "BLAB_TEST_EXTERIOR_TRANSDUCER_BACKEND", "cpu"))
     r = JSON.parsefile(joinpath(@__DIR__,"..","..","beat_contract","example-exterior-request.json"))
     s = r["compiled_system"]
     s["contract_version"] = 3
@@ -31,7 +31,7 @@ function driver_request(file; tags=[2], ideal=false)
     end
     r["excitation_port_ids"] = ["port:1"]
     r["frequencies_hz"] = [100.]
-    r["solver_options"] = Dict("precision"=>"float64","bem_backend"=>"cpu","quadrature_order"=>4,
+    r["solver_options"] = Dict("precision"=>"float64","bem_backend"=>backend,"quadrature_order"=>4,
         "singular_order"=>4,"regular_quadrature_mode"=>"fixed","transducer_reference_voltage_v"=>2.83)
     r["outputs"] = [Dict("id"=>q,"quantity"=>q,"target_ids"=>[],"options"=> q == "exterior_pressure" ?
         Dict("points_m"=>[[0.,0.,0.15],[0.,0.,2.],[1.,0.,2.]]) : Dict())
@@ -46,7 +46,18 @@ function captured(r)
             solve_request(deepcopy(r);event_mode=true)
         end
         seekstart(io)
-        [e["result"] for e in JSON.parse.(readlines(io)) if haskey(e,"result")]
+        results = [e["result"] for e in JSON.parse.(readlines(io)) if haskey(e,"result")]
+        if get(r["solver_options"], "bem_backend", "cpu") == "rocm"
+            @test !isempty(results)
+            for result in results
+                @test result["diagnostics"]["bem_backend"] == "rocm"
+                # This helper is also reused by coupled wavelength sweeps.
+                @test result["diagnostics"]["linear_solver"] in (
+                    "rocm_rocsolver_dense_lu", "rocm_hybrid_cpu_sparse_schur_plus_rocsolver_dense_lu",
+                )
+            end
+        end
+        results
     end
 end
 

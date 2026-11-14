@@ -7,6 +7,16 @@ before opening the request file. No matrix assembly is needed for negotiation.
 
 ## Handshake and version ownership
 
+The source-entry Deploy worker (`solver.jl`) also reports a `backends` map at
+runtime. Its `deploy_solver_backends` list describes supported solve paths;
+clients must separately check `backends.metal.available` before accepting a
+Metal solve. Device availability is evaluated at worker startup, not during
+package precompilation. A selected Metal environment requires its Metal package:
+dependency import and bundle compilation failures propagate with their original
+error instead of caching an engine with a missing accelerator. CPU-only loading
+does not require Metal. The standalone regression gate is
+`julia --startup-file=no src/beat_engine/julia_local/tests/metal_initialization_tests.jl`.
+
 [worker-v1.json](../src/beat_engine/beat_contract/worker-v1.json) is the engine-owned
 announcement template. Julia adds `runtime.julia_version` and `backends` at startup,
 then emits the resulting object as a single JSON line on stdout, with `type: ready`.
@@ -64,6 +74,16 @@ The request file must remain available until the terminal event. Its mesh paths
 and compiled payload follow the [compiled-system contract](BEAT%20Compiled%20System%20Contract.md).
 Field binary filenames resolve against the field request's directory. All paths
 are local to the worker; this protocol does not provide remote asset transfer.
+
+Field requests default to `field_quantity: "pressure"`. CPU and CUDA workers also
+advertise `pressure_gradient_v1` in the per-backend `field_quantities` ready map.
+This quantity requires quadrature order 4 and returns a complex `(point, 4)` array:
+pressure followed by its observation-coordinate derivatives in X, Y, Z (Pa/m).
+Binary arrays use C row order and the result echoes `field_quantity`. Clients must
+check the capability before requesting gradients from an older worker.
+The gradient is differentiated analytically; near-panel quadrature is refined
+adaptively on the CPU for both backends. Samples on the boundary are unsupported.
+With positive-time phasors, velocity is `gradient / (-i * omega * density)`.
 
 Before submission the client checks the selected contract versions, operation,
 precision, solve kind, requested backend, and marker cancellation support when

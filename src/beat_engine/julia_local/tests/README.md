@@ -44,7 +44,7 @@ degree-one spherical wave. For radius `a`, real unit translation velocity along
 `h1(z) = -exp(i*z)*(z+i)/z^2`. The normal derivative at the surface follows
 independently from linearized Euler, `dp/dr = i*rho*omega*dot(u,x/r)`.
 Positive time conjugates the radial wave and reverses that derivative's sign.
-See [NASA-CR-98418, Appendix B, equations B-1–B-4](https://ntrs.nasa.gov/api/citations/19690015869/downloads/19690015869.pdf).
+See [NASA-CR-98418, Appendix B, equations B-1â€“B-4](https://ntrs.nasa.gov/api/citations/19690015869/downloads/19690015869.pdf).
 The tests implement explicit Hankel expressions without calling engine phasor
 helpers or Green functions, then compare the public compiled solve's complex
 outputs. The 8% bound is retained from the monopole check. The translating sphere
@@ -71,6 +71,28 @@ The existing `BLAB_RUN_COUPLED_CUDA=1`, `BLAB_RUN_COUPLED_ROCM=1` and
 `BLAB_RUN_COUPLED_METAL=1` gates in `runtests.jl` still require functioning
 hardware and their corresponding Julia projects. CPU reference success does not
 qualify CUDA, ROCm, or Metal.
+
+The ROCm hardware runner also executes `rocm_phasor_tests.jl` and
+`rocm_worker_phasor_tests.jl`; both require a functional device and fail when it
+is unavailable. The native gate checks Float32/Float64 exterior operators,
+complex multi-RHS pressures and fields for off/X/XY/ground symmetry, then
+monolithic and condensed voltage-driven coupled solves on either side of a
+cavity pole. The request gate checks source and compiled requests, CPU parity,
+retained-field cache reuse across negative/positive/negative requests, and
+restoration of the default convention. Run either file directly under the
+`julia_rocm` project when diagnosing a failure. Neither gate establishes warmed
+performance or arbitrary-geometry accuracy.
+
+`rocm_exterior_transducer_tests.jl` is also part of the ROCm hardware runner.
+It reuses the analytical exterior BEM/LEM and symmetry gates with an explicit
+ROCm backend and checks the reported ROCm dense solve for every GPU request.
+Additional Float32/Float64 comparisons with CPU cover both phasors, ground
+reflection, boundary traces, radiation impedance, diaphragm velocity, current,
+and field outputs. The ordinary tests keep their CPU default.
+The [RX 7600 native Windows qualification](../../../../docs/ROCm%20RX%207600%20Qualification.md)
+records the tested ROCm stack, dedicated assembly/field/symmetry gates, coupled
+hardware execution, and remaining qualification gaps. The standalone
+`scripts/validate_rocm_coupled.jl` uses the packaged fixtures in this directory.
 
 The Metal gate runs with the `julia_metal` project on Apple Silicon. Its
 `metal production pipeline` testset solves `off`, `x` and `xy` on the meshes
@@ -145,9 +167,30 @@ by the sum of each face's maximum vertex radius about its centroid.
 with separation. Singular pairs retain their existing Duffy correction. Enabled
 requests use four-operator assembly, bypassing the fused Burton-Miller path,
 and report applied pair count, maximum order and selected image-transform count
-in result diagnostics. The source option rejects CUDA, ROCm and Metal before
+in result diagnostics. CPU and ROCm accept the source option; CUDA and Metal are rejected before
 loading geometry or devices. Existing explicit compiled proximity inputs and
 CUDA single-cache entry points retain their contracts.
+
+ROCm applies correction-minus-regular paired quadrature through its native GPU
+pair kernels before symmetry row weights. Host near-cache collections support
+all image transforms; difference rules are rebuilt against the current regular
+rule. Its explicit host-staged assembly mode forwards the same caches to CPU
+assembly. CUDA device correction caches remain unsupported on ROCm.
+`rocm_near_correction_tests.jl` compares both ROCm assembly modes with CPU across
+Float32/Float64, both phasors, regular-rule changes, and off/X/XY/ground symmetry.
+`rocm_near_source_tests.jl` also checks source-request CPU parity, diagnostics,
+and an empty selection. Both are required by the ROCm hardware runner.
+
+ROCm also accepts opt-in `regular_quadrature_mode="wavelength"` in source and
+compiled exterior/coupled requests. Fixed quadrature remains the default. Each
+selected order uses matching assembly, identity, and field caches; coupled
+variants share the original FEM/interface and direct singular buffers. All
+variant device buffers are released when the request finishes or fails.
+`rocm_wavelength_tests.jl` compares changing/revisited orders with fixed-order
+CPU references for ideal exterior, electrodynamic-transducer, and coupled
+requests, including cached/uncached monolithic and condensed solves.
+`rocm_wavelength_source_tests.jl` covers source sweeps with symmetry and near
+corrections. Both are explicit ROCm hardware gates.
 
 
 ## Compiled-worker dispatch qualification

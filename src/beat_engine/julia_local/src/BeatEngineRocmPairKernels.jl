@@ -87,8 +87,10 @@ function _rocm_regular_slp_adjoint_dlp_pairs_kernel!(
     trial_nz = trial_sign_z * normals[trial_index + 2 * face_count]
     jac_scale = typeof(k)(4) * areas[test_index] * areas[trial_index]
 
+    # Cache construction sizes both quadrature arrays from rule_count, and the
+    # guarded color-pair lookup supplies valid mesh element indices.
     test_q = 1
-    while test_q <= rule_count
+    @inbounds while test_q <= rule_count
         test_xi = rule_points[test_q]
         test_eta = rule_points[test_q + rule_count]
         tb1 = one(k) - test_xi - test_eta
@@ -278,8 +280,9 @@ function _rocm_regular_hyp_pairs_kernel!(
     )
     jac_scale = typeof(k)(4) * areas[test_index] * areas[trial_index]
 
+    # Match the validated cache/index contract of the SLP/adjoint/DLP loop.
     test_q = 1
-    while test_q <= rule_count
+    @inbounds while test_q <= rule_count
         test_xi = rule_points[test_q]
         test_eta = rule_points[test_q + rule_count]
         tb1 = one(k) - test_xi - test_eta

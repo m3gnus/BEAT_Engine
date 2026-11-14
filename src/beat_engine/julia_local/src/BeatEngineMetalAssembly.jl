@@ -26,6 +26,8 @@ function _assemble_regular_galerkin_operators_metal_native(
     timing,
     singular_cache,
     metal_singular_cache,
+    near_correction_cache,
+    image_near_correction_cache,
     symmetry_mode::Symbol,
 ) where {T<:AbstractFloat}
     normalized_mode = normalized_symmetry_mode(symmetry_mode)
@@ -172,6 +174,35 @@ function _assemble_regular_galerkin_operators_metal_native(
         timing !== nothing && (timing["metal_host_singular_corrections"] = host_elapsed)
         singular_pairs = correction_cache.pair_count
     end
+    # Replace the regular-rule contribution for close pairs before applying
+    # orbit weights, exactly as CPU assembly does. Shared buffers can be edited
+    # on the host after synchronization; private buffers need a round trip.
+    near_caches = (
+        _near_correction_cache_tuple(near_correction_cache)...,
+        _near_correction_cache_tuple(image_near_correction_cache)...,
+    )
+    near_pair_count = sum(c.pair_count for c in near_caches; init=0)
+    near_elapsed = @elapsed if near_pair_count > 0
+        Metal.synchronize()
+        keys = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
+        host = NamedTuple{keys}(map(keys) do key
+            buffer = getfield(operators, key)
+            Metal.is_shared(buffer) ? unsafe_wrap(Array, buffer) : Array(buffer)
+        end)
+        elements = _beat_cpu_element_data(mesh, p1_space, dp0_space)
+        quadrature = _beat_cpu_regular_quadrature_data(mesh, rule)
+        groups = _beat_cpu_element_color_groups(mesh, indices)
+        for correction in near_caches
+            _beat_cpu_apply_near_cache!(host, mesh, elements, indices, groups,
+                Threads.nthreads() > 1, k, quadrature, correction)
+        end
+        for key in keys
+            buffer = getfield(operators, key)
+            Metal.is_shared(buffer) || copyto!(buffer, getfield(host, key))
+        end
+        Metal.synchronize()
+    end
+    timing !== nothing && (timing["metal_host_near_corrections"] = near_elapsed)
     weight_elapsed = @elapsed _apply_metal_operator_p1_row_weights!(operators, mesh, normalized_mode)
     timing !== nothing && (timing["metal_native_symmetry_row_weights"] = weight_elapsed)
     total_pairs = length(indices) * length(indices)
@@ -189,6 +220,8 @@ function _assemble_regular_galerkin_operators_metal_native(
             singular_pairs=singular_pairs,
             skipped_pairs=skip_singular ? adjacent_pairs : 0,
             image_singular_pairs=image_singular_pairs,
+            near_pair_count=near_pair_count,
+            near_pair_quadrature_order=maximum((c.correction_order for c in near_caches); init=0),
             on_gpu=true,
             gpu_backend=:metal,
             host_staged_assembly=false,
@@ -223,6 +256,8 @@ function assemble_regular_galerkin_operators_metal_regular(
     timing=nothing,
     singular_cache=nothing,
     metal_singular_cache=nothing,
+    near_correction_cache=nothing,
+    image_near_correction_cache=nothing,
     assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
@@ -246,6 +281,8 @@ function assemble_regular_galerkin_operators_metal_regular(
             timing=timing,
             singular_cache=singular_cache,
             metal_singular_cache=metal_singular_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=symmetry_mode,
         )
     end
@@ -267,6 +304,8 @@ function assemble_regular_galerkin_operators_metal_regular(
             threaded=true,
             singular_cache=singular_cache,
             cpu_cache=host_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=normalized_mode,
         )
     end

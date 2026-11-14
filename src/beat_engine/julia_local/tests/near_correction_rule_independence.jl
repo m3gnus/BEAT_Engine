@@ -61,6 +61,10 @@ const MESHES = Dict(
     :x => snap_symmetry_planes(unit_sphere_mesh(:half), :x),
     :xy => snap_symmetry_planes(unit_sphere_mesh(:quarter), :xy),
 )
+let sphere = unit_sphere_mesh()
+    MESHES[:ground] = BoundaryMesh([v + SVector{3,T}(0, 2, 0) for v in sphere.vertices],
+                                  sphere.faces, sphere.physical_tags)
+end
 const K = T(3.0)
 
 function corrections(mesh, symmetry_mode::Symbol)
@@ -170,20 +174,23 @@ end
     end
     identity_cache, image_caches, _ = corrections(mesh, :xy)
     p1, dp0, rule = build_p1_space(mesh), build_dp0_space(mesh), triangle_rule(T, 1)
-    for backend in (:metal, :rocm)
-        for keyword in (:near_correction_cache, :image_near_correction_cache,
-                        :device_near_correction_cache, :device_image_near_correction_cache)
-            @test_throws r"Near-singular correction is not implemented" assemble_regular_galerkin_operators(
+    for backend in (:rocm,)
+        for keyword in (:device_near_correction_cache, :device_image_near_correction_cache)
+            @test_throws r"requires host correction caches" assemble_regular_galerkin_operators(
                 mesh, p1, dp0, K, rule; backend=backend, (keyword=>identity_cache,)...)
         end
+    end
+    for keyword in (:device_near_correction_cache, :device_image_near_correction_cache)
+        @test_throws r"requires host correction caches" assemble_regular_galerkin_operators(
+            mesh, p1, dp0, K, rule; backend=:metal, (keyword=>identity_cache,)...)
     end
     @test_throws r"cache collections are supported only on CPU" assemble_regular_galerkin_operators(
         mesh, p1, dp0, K, rule; backend=:cuda, image_near_correction_cache=image_caches)
     # Refuse before mesh loading/device initialization, even on a machine
     # without the accelerator package and even when there would be no pairs.
-    for backend in ("cuda", "metal", "rocm")
+    for backend in ("cuda", "metal")
         request = Dict("config"=>Dict("near_correction_enabled"=>true), "beat_engine_backend"=>backend)
-        @test_throws r"supported only on the CPU" solve_request_impl(request)
+        @test_throws r"supported only on CPU and ROCm" solve_request_impl(request)
     end
 end
 
@@ -201,10 +208,14 @@ function write_test_mesh(io, mesh)
 end
 
 @testset "source requests apply near correction" begin
+    source_backend = get(ENV, "BLAB_TEST_NEAR_SOURCE_BACKEND", "cpu")
+    conventions = source_backend == "rocm" ? (NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR) : (NEGATIVE_TIME_PHASOR,)
+    cases = [(:off, 1.0e9), (:x, 1.0e9), (:xy, 1.0e9), (:off, 1.0e-9)]
+    source_backend == "rocm" && push!(cases, (:ground, 1.0e9))
     previous_fused = get(ENV, "BLAB_BEAT_FUSED_BM", nothing)
     try
         ENV["BLAB_BEAT_FUSED_BM"] = "1"
-        for (mode, cutoff) in ((:off, 1.0e9), (:x, 1.0e9), (:xy, 1.0e9), (:off, 1.0e-9))
+        for (mode, cutoff) in cases, convention in conventions
             mktemp() do path, io
                 write_test_mesh(io, MESHES[mode])
                 config = Dict{String,Any}(
@@ -215,7 +226,8 @@ end
                     "near_correction_enabled"=>true, "near_correction_cutoff"=>cutoff,
                     "near_correction_order"=>8,
                 )
-                request = Dict("config"=>config, "frequencies_hz"=>[100.0], "beat_engine_backend"=>"cpu")
+                request = Dict("config"=>config, "frequencies_hz"=>[100.0],
+                               "beat_engine_backend"=>source_backend, "phasor_convention"=>convention)
                 mktemp() do _, output
                     redirect_stdout(output) do
                         solve_request(request)
@@ -240,7 +252,29 @@ end
                         @test diagnostics["near_pair_quadrature_order"] == 0
                         @test diagnostics["near_image_transform_count"] == 0
                     end
-                    @test diagnostics["regular_assembly_mode"] in ("cpu_colored_threads", "cpu_serial")
+                    if source_backend == "rocm"
+                        @test startswith(diagnostics["regular_assembly_mode"], "rocm_native_")
+                        @test diagnostics["backend"] == "rocm"
+                        @test diagnostics["phasor_convention"] == convention
+                        reference_request = deepcopy(request)
+                        reference_request["beat_engine_backend"] = "cpu"
+                        reference = mktemp() do _, cpu_output
+                            redirect_stdout(cpu_output) do
+                                solve_request(reference_request)
+                            end
+                            flush(cpu_output)
+                            seekstart(cpu_output)
+                            cpu_events = [JSON.parse(line) for line in eachline(cpu_output)]
+                            only([event["result"] for event in cpu_events if event["type"] == "result"])
+                        end
+                        for axis in ("horizontal_pressure", "vertical_pressure")
+                            actual = ComplexF32.(result[axis]["real"][1], result[axis]["imag"][1])
+                            expected = ComplexF32.(reference[axis]["real"][1], reference[axis]["imag"][1])
+                            @test isapprox(actual, expected; rtol=5e-4)
+                        end
+                    else
+                        @test diagnostics["regular_assembly_mode"] in ("cpu_colored_threads", "cpu_serial")
+                    end
                     for component in ("real", "imag")
                         @test all(isfinite, Iterators.flatten(result["horizontal_pressure"][component]))
                     end

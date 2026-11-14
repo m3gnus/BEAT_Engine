@@ -72,7 +72,7 @@ uuid = "8e1a2b34-6c5d-4f70-8b9a-1c2d3e4f5a67"
 version = "0.1.0"
 
 [[deps.BeatEngineMetalBundle]]
-deps = ["JSON", "LinearAlgebra", "Metal", "PrecompileTools", "Printf", "SparseArrays", "StaticArrays", "Statistics"]
+deps = ["JSON", "LinearAlgebra", "Metal", "PrecompileTools", "Printf", "SHA", "Serialization", "SparseArrays", "StaticArrays", "Statistics"]
 path = "../julia_engine/BeatEngineMetalBundle"
 uuid = "046d46cd-a62e-40e9-999a-57ef70256860"
 version = "0.1.0"

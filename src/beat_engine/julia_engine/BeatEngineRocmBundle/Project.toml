@@ -3,6 +3,8 @@ uuid = "4dcecca2-7a78-4163-9eba-4966e709c0e0"
 version = "0.1.0"
 
 [deps]
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"

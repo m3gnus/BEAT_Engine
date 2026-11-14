@@ -1,6 +1,12 @@
 using Test
-# Hardware suites use the Metal project, whose compiled bundle also contains
-# the CPU host workload. Do not require an undeclared CPU package there.
+# Accelerator qualification also exercises the shared CPU workload. CUDA and
+# ROCm do not declare the compiled CPU bundle; expose the checked-in packages
+# after the active environment so its accelerator dependency versions win.
+const COMPILED_WORKLOAD_PROJECT = basename(dirname(Base.active_project()))
+if COMPILED_WORKLOAD_PROJECT in ("julia_cuda", "julia_rocm")
+    push!(LOAD_PATH, normpath(joinpath(@__DIR__, "..", "..", "julia_engine")))
+end
+# The Metal bundle contains the same host workload.
 if basename(dirname(Base.active_project())) == "julia_metal"
     import BeatEngineCompiledMetalBundle
     const CompiledWorkloadBundle = BeatEngineCompiledMetalBundle
@@ -127,7 +133,7 @@ end
 end
 
 # The CPU compiled entry is only declared in the CPU project.
-if @isdefined(BeatEngineCompiledCpuBundle)
+if COMPILED_WORKLOAD_PROJECT == "julia_local"
 @testset "tiny coupled request solves through compiled CPU entry and fallback" begin
     bundle = BeatEngineCompiledCpuBundle
     request = bundle.coupled_workload_request(; tiny=true)

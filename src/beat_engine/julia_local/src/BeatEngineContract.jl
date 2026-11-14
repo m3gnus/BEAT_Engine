@@ -9,6 +9,9 @@ using .BeatEngineProvenance
 export validate_system_request, worker_ready, validate_worker_submission
 
 # The same engine-owned schema is loaded by the standalone Python validator.
+# JSON inputs must invalidate compiled bundles just like included Julia sources.
+include_dependency(joinpath(@__DIR__, "..", "..", "beat_contract", "system-v1.schema.json"))
+include_dependency(joinpath(@__DIR__, "..", "..", "beat_contract", "worker-v1.json"))
 const SCHEMA = JSON.parsefile(joinpath(@__DIR__, "..", "..", "beat_contract", "system-v1.schema.json"))
 const WORKER = JSON.parsefile(joinpath(@__DIR__, "..", "..", "beat_contract", "worker-v1.json"))
 
@@ -192,6 +195,9 @@ function graph(system)
     end
     meshes, regions, boundaries, components = (collections[key] for key in ("meshes", "regions", "boundaries", "components"))
     for region in values(regions)
+        if haskey(region["loss_model"], "thermoviscous_wall_losses")
+            fail("region.loss_model", "assign thermoviscous wall losses to boundary parameters")
+        end
         references(region["mesh_ids"], meshes, "region $(region["id"]).mesh_ids")
         for group in region["volume_groups"]
             group["mesh_id"] in region["mesh_ids"] && group["dimension"] == 3 || fail("volume_groups", "must reference a volume group on a region mesh")
@@ -199,6 +205,12 @@ function graph(system)
     end
     for boundary in values(boundaries)
         references([boundary["region_id"]], regions, "boundary $(boundary["id"]).region_id")
+        if get(boundary["parameters"], "thermoviscous_wall_losses", "off") != "off" && (
+            regions[boundary["region_id"]]["kind"] != "bounded_air" ||
+            boundary["kind"] != "rigid" || haskey(boundary["parameters"], "wall_impedance") ||
+            any(boundary["id"] in c["boundary_ids"] for c in values(components)))
+            fail("boundary.parameters", "thermoviscous wall losses require an unlined, stationary rigid wall in bounded air")
+        end
         group = boundary["group"]
         group["mesh_id"] in regions[boundary["region_id"]]["mesh_ids"] && group["dimension"] == 2 || fail("boundary.group", "must reference a surface group on a region mesh")
     end

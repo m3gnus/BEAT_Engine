@@ -27,6 +27,7 @@ backend rather than inherit whatever the building process happened to have set.
 module BeatEngineMetalBundle
 
 using PrecompileTools: @compile_workload
+import Metal
 
 const BEAT_ENGINE_BACKEND = "metal"
 

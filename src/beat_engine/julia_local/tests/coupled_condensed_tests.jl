@@ -1,6 +1,86 @@
 include(joinpath(@__DIR__, "coupled_condensed_test_setup.jl"))
 include(joinpath(@__DIR__, "condensed_backend_tests.jl"))
 
+@testset "ROCm automatic transducer condensation preserves existing cache layouts" begin
+    select = BeatEngineCoupled._rocm_transducer_condensation_enabled
+    drivers = [:driver]
+    interface = [5, 2, 5]
+    compact_cache = (retained_fem_vertices=[2, 5],)
+    retained_cache = (retained_fem_vertices=[2, 4, 5],)
+    for mode in (nothing, "auto", " AUTO ")
+        withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => mode) do
+            @test select(:rocm, true, drivers)
+            @test select(:rocm, true, drivers; cache=compact_cache, interface_vertices=interface)
+            @test !select(:rocm, true, drivers; cache=retained_cache, interface_vertices=interface)
+            @test !select(:rocm, true, drivers; cache=retained_cache)
+            @test !select(:rocm, false, drivers)
+            @test !select(:rocm, true, [])
+            for backend in (:cpu, :cuda, :metal)
+                @test !select(backend, true, drivers)
+            end
+        end
+    end
+    for mode in ("off", "0", "false")
+        withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => mode) do
+            @test !select(:rocm, true, drivers)
+        end
+    end
+    for mode in ("on", "1", "true")
+        withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => mode) do
+            @test select(:rocm, true, drivers; cache=retained_cache, interface_vertices=interface)
+        end
+    end
+    withenv("BLAB_COUPLED_TRANSDUCER_CONDENSATION" => "invalid") do
+        @test_throws ErrorException select(:rocm, true, drivers)
+    end
+end
+
+@testset "Shared transducer elimination against a full complex system" begin
+    rng = MersenneTwister(80429)
+    acoustic = randn(rng, ComplexF64, 6, 6) + 8I
+    motion = randn(rng, ComplexF64, 6, 2)
+    force = randn(rng, ComplexF64, 6, 2)
+    mechanical = randn(rng, ComplexF64, 2, 2) + 5I
+    fem_rhs = randn(rng, ComplexF64, 6, 3)
+    mechanical_rhs = randn(rng, ComplexF64, 2, 3)
+    fem_rhs[:, 1] .= 0                  # Pure mechanical/electrical forcing.
+    mechanical_rhs[:, 2] .= 0           # Pure FEM forcing; third column mixes both.
+    for retained in (Int[], [2, 5], collect(1:6)), scale in (2im, -2im)
+        interior = setdiff(1:6, retained)
+        factor = isempty(interior) ? nothing : lu(sparse(acoustic[interior, interior]))
+        try
+            fields = BeatEngineCoupled._condensed_transducer_motion_fields(
+                factor, interior, retained, sparse(acoustic[interior, retained]),
+                sparse(acoustic[retained, interior]), 6, sparse(motion), sparse(force))
+            schur = copy(acoustic[retained, retained])
+            forward = zeros(ComplexF64, length(interior), 3)
+            if !isempty(interior)
+                schur -= acoustic[retained, interior] * (factor \ acoustic[interior, retained])
+                forward = factor \ fem_rhs[interior, :]
+            end
+            reduced_matrix = [schur (-scale .* fields.motion_gamma);
+                              (-transpose(fields.force_gamma)) (mechanical - scale .* fields.motion_force_correction)]
+            reduced_rhs = vcat(fem_rhs[retained, :] - acoustic[retained, interior] * forward,
+                mechanical_rhs + transpose(fields.force_solution) * fem_rhs[interior, :])
+            reduced = reduced_matrix \ reduced_rhs
+            pressure = zeros(ComplexF64, 6, 3)
+            pressure[retained, :] = reduced[1:length(retained), :]
+            velocity = reduced[(length(retained) + 1):end, :]
+            if !isempty(interior)
+                pressure[interior, :] = factor \ (fem_rhs[interior, :] +
+                    scale .* fields.motion_interior * velocity -
+                    acoustic[interior, retained] * pressure[retained, :])
+            end
+            full_matrix = [acoustic (-scale .* motion); (-transpose(force)) mechanical]
+            reference = full_matrix \ vcat(fem_rhs, mechanical_rhs)
+            @test isapprox(vcat(pressure, velocity), reference; rtol=2e-13)
+            @test norm(full_matrix * vcat(pressure, velocity) - vcat(fem_rhs, mechanical_rhs)) < 1e-12
+        finally
+            isnothing(factor) || finalize(factor)
+        end
+    end
+end
+
 @testset "Schur condensation algebra" begin
     system, operators, retained = condensed_synthetic_case(Float64)
     vertex_count = size(system, 1)
@@ -1622,6 +1702,7 @@ end
         stiffness=stiffness32,
         bulk_loss_factor_by_vertex=loss,
         wall_impedance_operators=[(matrix=wall, thickness_m=0.02f0, flow_resistivity_pa_s_per_m2=12000f0)],
+        thermoviscous_operator=nothing,
     )
     store = Dict{Symbol,Any}()
     frequency, sound_speed, density = 20f0, 343f0, 1.21f0
@@ -1636,6 +1717,22 @@ end
         SparseMatrixCSC{Float64,Int}(wall)
     @test eltype(system) == ComplexF64
     @test system == expected
+    thermoviscous = merge(prepared, (
+        thermoviscous_operator=thermoviscous_surface_operator(mesh32, radiator_faces),
+    ))
+    lossy = BeatEngineCoupledCondensed._fem_system_float64(
+        store, mesh32, thermoviscous, frequency, sound_speed, density)
+    @test lossy ≈ add_thermoviscous_terms(expected,
+        thermoviscous_surface_operator(mesh64, radiator_faces),
+        Float64(frequency), Float64(sound_speed), Float64(density))
+    @test lossy != system
+    treated_cache = store[:matrices]
+    BeatEngineCoupledCondensed._fem_system_float64(
+        store, mesh32, thermoviscous, 200f0, sound_speed, density)
+    @test store[:matrices] === treated_cache
+    @test BeatEngineCoupledCondensed._fem_system_float64(
+        store, mesh32, prepared, frequency, sound_speed, density) == system
+    @test store[:matrices] !== treated_cache
     # The matrices are cached by what they depend on, across frequencies and mesh objects, and are
     # rebuilt when a dependency changes in place (a persistent worker reusing its cache).
     cached = store[:matrices]
@@ -1655,7 +1752,7 @@ end
     prepared.bulk_loss_factor_by_vertex[2] -= 0.01f0
     # Matrices with another element structure than the cached system are refused.
     wrong_structure = (stiffness=sparse(1.0f0 * I, vertex_count, vertex_count), bulk_loss_factor_by_vertex=loss,
-                       wall_impedance_operators=NamedTuple[])
+                       wall_impedance_operators=NamedTuple[], thermoviscous_operator=nothing)
     @test_throws "structure" BeatEngineCoupledCondensed._fem_system_float64(nothing, mesh32, wrong_structure, frequency, sound_speed, density)
 
     # Why: the air spring of a cavity with nothing retained, `Cᵀ A⁻¹ C` for a transducer surface load
@@ -1664,7 +1761,7 @@ end
     surface_load = assemble_boundary_mass_matrix(mesh64, radiator_faces, collect(1:vertex_count)) * ones(vertex_count)
     surface = SparseMatrixCSC{ComplexF64,Int}(reshape(ComplexF64.(surface_load), vertex_count, 1))
     air_spring(fem_system) = transpose(surface) * (lu(SparseMatrixCSC{ComplexF64,Int}(fem_system)) \ Matrix(surface))
-    lossless = (stiffness=stiffness32, bulk_loss_factor_by_vertex=zeros(Float32, vertex_count), wall_impedance_operators=NamedTuple[])
+    lossless = (stiffness=stiffness32, bulk_loss_factor_by_vertex=zeros(Float32, vertex_count), wall_impedance_operators=NamedTuple[], thermoviscous_operator=nothing)
     reference = air_spring(assemble_fem_dynamic_stiffness(stiffness64, mass64, omega / Float64(sound_speed)))
     single = air_spring(SparseMatrixCSC{ComplexF64,Int}(
         assemble_fem_dynamic_stiffness(stiffness32, mass32, Float32(2pi) * frequency / sound_speed),

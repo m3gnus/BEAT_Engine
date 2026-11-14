@@ -47,7 +47,7 @@ def accuracy(run, ref):
         actual = run["outputs"][key]
         if actual[1] != entry[1]:
             raise ValueError(f"{key}: output shape does not match the reference")
-        groups.setdefault(key.split("@")[0], []).append((complex_values(actual), complex_values(entry)))
+        groups.setdefault(key.rsplit("@", 1)[0], []).append((complex_values(actual), complex_values(entry)))
     result = {}
     for quantity, pairs in groups.items():
         num = den = worst = 0.0
@@ -112,15 +112,35 @@ def main():
         median = statistics.median(walls)
         half_range = (max(walls) - min(walls)) / 2 / median * 100
         memories = [r["memory_mb"] for r in runs]
+        memory_kinds = {
+            tuple(
+                r.get("memory_measurement", {}).get(key)
+                for key in (
+                    "metric",
+                    "scope",
+                    "peak_kind",
+                    "poll_interval_s",
+                    "dedicated_gpu_memory",
+                )
+            )
+            for r in runs
+        }
         print(f"{label} ({runs[0]['commit']}, {runs[0]['backend']}, n={len(runs)})")
         print(
             f"  wall    {median:.2f} s  range {min(walls):.2f}-{max(walls):.2f} (±{half_range:.1f}%)"
             f"  {first_median / median:.2f}x vs {stages[0][0]}"
         )
-        if all(m["peak_sweep"] is not None and m["before_sweep"] is not None for m in memories):
+        if len(memory_kinds) != 1:
+            print("  memory  unavailable (measurement methods differ across runs)")
+        elif all(m["peak_sweep"] is not None and m["before_sweep"] is not None for m in memories):
             peak = statistics.median(m["peak_sweep"] for m in memories)
             growth = statistics.median(m["peak_sweep"] - m["before_sweep"] for m in memories)
             print(f"  memory  peak {peak:.0f} MB, +{growth:.0f} MB over the pre-sweep worker")
+            metric, scope, peak_kind, interval, gpu = next(iter(memory_kinds))
+            if metric is None:
+                print("          measurement method unspecified (legacy report)")
+            else:
+                print(f"          {metric}; {scope}; {peak_kind}; polling {interval} s; dedicated GPU: {gpu}")
         else:
             print("  memory  unavailable (not measured for every run)")
         print("  sections " + "  ".join(f"{k.removesuffix('_s')} {v:.2f}" for k, v in sections(runs).items()))

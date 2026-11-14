@@ -53,7 +53,11 @@ else
     try
         @eval using $BEAT_ENGINE_BUNDLE_NAME
         @eval $BEAT_ENGINE_BUNDLE_NAME
-    catch
+    catch exception
+        # A broken Metal import/precompile must reach the caller, not produce a
+        # seemingly ready fallback worker with its accelerator missing.
+        BEAT_ENGINE_BUNDLE_NAME === :BeatEngineMetalBundle && rethrow()
+        @warn "BEAT bundle load failed; using source driver" bundle=BEAT_ENGINE_BUNDLE_NAME exception
         nothing
     end
 end

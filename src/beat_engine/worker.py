@@ -340,6 +340,7 @@ class WorkerProcess(IdleCleanupMixin):
                     encoding="utf-8",
                     errors="replace",
                     env=self.environment,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except FileNotFoundError as exc:
                 raise RuntimeError(

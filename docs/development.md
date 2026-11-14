@@ -45,3 +45,23 @@ Main is protected with required CI and PR review for contributors. The owner can
 merge their own PR after checks without a second maintainer; this exception is
 visible in GitHub history. Do not bypass failing checks. Resolve PR conversations
 and delete completed topic branches.
+
+## CI execution and caching
+
+CI runs for pull requests and pushes to `main`. Feature-branch and tag pushes do
+not start duplicate CI runs. Release publication still requires successful main
+push CI for the exact tagged commit. A newer PR revision cancels its older run;
+in-progress main runs are not cancelled by newer pushes.
+
+All five required checks remain: Linux, Windows and macOS CPU suites, Metal host
+tests, and the sweep benchmark. Each job caches Julia depot dependencies and
+compiled packages, isolated by OS, architecture, resolved Julia version and job.
+The primary key also includes the backend's packaged source/environment files;
+a fallback key reuses older dependencies while Julia revalidates compiled code.
+Environment instantiation and all tests still run on cache hits. Caches contain
+no test results or pass/fail decisions, and caching needs no write permission to
+the repository. Cache retention follows the repository's Actions cache policy.
+
+Compare job setup durations and aggregate runner minutes across later runs to
+measure cache benefits. Keep the full platform matrix until that evidence and a
+separate coverage audit justify changing which checks run on a PR.

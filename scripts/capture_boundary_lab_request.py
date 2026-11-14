@@ -29,12 +29,16 @@ DEFAULT_FREQUENCIES = [20.0 * 1000.0 ** (i / 11) for i in range(12)]
 
 def seeded_exterior_project(mesh: Path, tag: int, scale: float, symmetry: str, directory: Path) -> Path:
     """Write the exterior-only project the GUI seeds from a mesh and a radiator tag."""
-    from blab.config import MeshConfig, RadiatorConfig
+    from blab.config import RadiatorConfig
+    from blab.mesh_inventory import InventoryEntry, inspect_system_meshes
     from blab.physical_model import physical_system_to_dict
-    from blab.ui.physical_system_migration import seed_exterior_system_from_solver_inputs
+    from blab.project.migration import seed_exterior_system
 
-    system, channels = seed_exterior_system_from_solver_inputs(
-        (MeshConfig(name=mesh.stem, file=str(mesh.resolve()), scale_factor=scale),),
+    inventory = inspect_system_meshes(
+        (InventoryEntry(name=mesh.stem, source_file=str(mesh.resolve()), scale_factor=scale),)
+    )
+    system, channels = seed_exterior_system(
+        inventory,
         (RadiatorConfig(name=f"{mesh.stem}:radiator", tag=tag, mesh=mesh.stem),),
     )
     path = directory / f"{mesh.stem}.blab.json"

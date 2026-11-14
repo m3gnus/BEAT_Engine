@@ -1,3 +1,37 @@
+function _rocm_near_difference_rule(correction::TriangleRule{T}, regular::TriangleRule{T}) where {T}
+    test_points = SVector{2,T}[]
+    trial_points = SVector{2,T}[]
+    weights = T[]
+    # The regular contribution is already in the operators. Integrate the
+    # replacement minus that contribution using the same native pair kernels.
+    for (rule, sign) in ((correction, one(T)), (regular, -one(T)))
+        for i in eachindex(rule.points), j in eachindex(rule.points)
+            push!(test_points, rule.points[i])
+            push!(trial_points, rule.points[j])
+            push!(weights, sign * rule.weights[i] * rule.weights[j])
+        end
+    end
+    return DuffyRule(test_points, trial_points, weights)
+end
+
+function _add_rocm_near_corrections!(operators, regular_cache, k, rule, near_caches)
+    for near in near_caches
+        near.pair_count == 0 && continue
+        # Build against this call's regular rule: a geometry cache may be reused
+        # when wavelength-dependent quadrature selects a different order.
+        host = SingularCorrectionCache(near.pairs_by_test, near.pairs,
+            [_rocm_near_difference_rule(correction, rule) for correction in near.correction_rules],
+            NTuple{3,SVector{3,typeof(k)}}[], near.pair_count)
+        device = build_rocm_singular_correction_cache(host)
+        try
+            _launch_rocm_singular_block_gather_kernels!(operators, regular_cache, device, k, near.trial_transform)
+        finally
+            release_rocm_singular_correction_cache!(device)
+        end
+    end
+    return nothing
+end
+
 function build_rocm_singular_correction_cache(cache::SingularCorrectionCache{T}) where {T<:AbstractFloat}
     _require_rocm!()
     face_count = length(cache.pairs_by_test)
@@ -19,7 +53,8 @@ function build_rocm_singular_correction_cache(cache::SingularCorrectionCache{T})
         pair_offsets[test_index + 1] = Int32(length(trial_indices) + 1)
     end
 
-    total_rule_points = sum(length(rule.weights) for rule in cache.rules)
+    # A separated ground image has no singular pairs and therefore no rules.
+    total_rule_points = sum(length(rule.weights) for rule in cache.rules; init=0)
     rule_offsets = Vector{Int32}(undef, length(cache.rules) + 1)
     rule_test_points = Matrix{T}(undef, total_rule_points, 2)
     rule_trial_points = Matrix{T}(undef, total_rule_points, 2)

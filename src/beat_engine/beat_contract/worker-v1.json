@@ -6,7 +6,7 @@
   },
   "engine": {
     "name": "BEAT Engine",
-    "version": "0.3.0"
+    "version": "0.8.0"
   },
   "contracts": {
     "system_request": [
@@ -40,7 +40,12 @@
     "interior_fem",
     "coupled_fem_bem_lem"
   ],
+  "deploy_solver_backends": ["cpu", "cuda", "metal", "rocm"],
   "exterior_source_profiles": [
+    "uniform_normal",
+    "rigid_translation"
+  ],
+  "coupled_exterior_source_profiles": [
     "uniform_normal",
     "rigid_translation"
   ],
@@ -70,5 +75,11 @@
   "exterior_component_kinds": [
     "ideal_velocity_source",
     "electrodynamic_transducer"
+  ],
+  "fem_wall_loss_models": [
+    "thin_boundary_layer"
+  ],
+  "fem_wall_loss_scopes": [
+    "boundary"
   ]
 }

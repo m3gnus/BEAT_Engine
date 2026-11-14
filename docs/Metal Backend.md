@@ -45,6 +45,33 @@ The request option `coupled_bem_assembly` remains the CUDA control; it does not
 select this Metal path. Monolithic Metal solves and full-matrix validation
 continue to assemble individual operators.
 
+## Deploy exterior and speaker-ROM requests
+
+The source worker supports Metal for `boundary_lab_deploy_solve`,
+`boundary_lab_deploy_rom`, microphone sweeps, and cached field requests.
+`deploy_solver_backends` in the source and compiled worker handshakes advertises
+the engine distribution's Deploy capabilities; device availability is separate.
+
+Deploy assembles four operators on Metal, presents them to CPU dense LU, and
+uses the existing host GMRES speaker-ROM feedback solve for Level 3. It retains
+Metal geometry across sweep frequencies and a Metal field cache for audience
+updates. The effective assembly mode is `operator_matrices`; Deploy does not
+yet use fused Metal direct-system assembly.
+
+Metal operator assembly now accepts host `near_correction_cache` and
+`image_near_correction_cache` values. CPU quadrature replaces the regular-rule
+contribution for those pairs before symmetry row weighting. Shared buffers are
+edited in place after GPU synchronization; private buffers are copied back.
+Device-only near caches remain rejected. The general source request's automatic
+near-pair selection remains CPU-only; this extension serves callers, such as
+Deploy, that supply explicit correction caches. Diagnostics identify CPU near
+corrections and the host dense solver separately from the Metal field backend.
+
+Run `tests/metal_near_correction_tests.jl` under the Metal Julia project for the
+hardware gate: CPU operator agreement for direct and ground-image corrections,
+both phasor conventions, both storage modes, and two quadrature rules. Hardware
+qualification invokes this gate; it fails if no functional Metal device exists.
+
 ## Execution model
 
 Exterior solves take the fused Burton-Miller path described below, which never

@@ -1,5 +1,17 @@
 name: CI
-on: [push, pull_request]
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Superseded PR commits can stop; main runs remain eligible for release tagging.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   cpu:
     strategy:
@@ -13,13 +25,29 @@ jobs:
         with:
           python-version: "3.11"
       - uses: julia-actions/setup-julia@v2
+        id: julia
         with:
           version: "1.12"
+      # Julia validates compiled code after source changes; restore older depot
+      # contents to reuse dependencies, then save under this source/environment key.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.julia/artifacts
+            ~/.julia/compiled
+            ~/.julia/logs
+            ~/.julia/packages
+            ~/.julia/registries
+            ~/.julia/scratchspaces
+          key: julia-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.julia.outputs.julia-version }}-${{ github.job }}-${{ hashFiles('src/beat_engine/julia_local/**') }}
+          restore-keys: |
+            julia-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.julia.outputs.julia-version }}-${{ github.job }}-
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff check src/beat_engine/*.py src/beat_engine/beat_contract tests
       - run: python -m ruff format --check pyproject.toml scripts src tests
       - run: python -m pytest
       - run: python -m beat_engine instantiate --backend cpu
+      - run: julia --startup-file=no src/beat_engine/julia_local/tests/metal_initialization_tests.jl
       - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local src/beat_engine/julia_local/tests/runtests.jl
       - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local src/beat_engine/julia_local/tests/reference_tests.jl
       - run: python -m build
@@ -49,8 +77,23 @@ jobs:
         with:
           python-version: "3.11"
       - uses: julia-actions/setup-julia@v2
+        id: julia
         with:
           version: "1.12"
+      # Julia validates compiled code after source changes; restore older depot
+      # contents to reuse dependencies, then save under this source/environment key.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.julia/artifacts
+            ~/.julia/compiled
+            ~/.julia/logs
+            ~/.julia/packages
+            ~/.julia/registries
+            ~/.julia/scratchspaces
+          key: julia-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.julia.outputs.julia-version }}-${{ github.job }}-${{ hashFiles('src/beat_engine/julia_local/**', 'src/beat_engine/julia_metal/**') }}
+          restore-keys: |
+            julia-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.julia.outputs.julia-version }}-${{ github.job }}-
       - run: python -m pip install -e .
       - run: python -m beat_engine instantiate --backend metal
       - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_metal src/beat_engine/julia_local/tests/metal_host_tests.jl
@@ -78,8 +121,23 @@ jobs:
         with:
           python-version: "3.11"
       - uses: julia-actions/setup-julia@v2
+        id: julia
         with:
           version: "1.12"
+      # Julia validates compiled code after source changes; restore older depot
+      # contents to reuse dependencies, then save under this source/environment key.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.julia/artifacts
+            ~/.julia/compiled
+            ~/.julia/logs
+            ~/.julia/packages
+            ~/.julia/registries
+            ~/.julia/scratchspaces
+          key: julia-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.julia.outputs.julia-version }}-${{ github.job }}-${{ hashFiles('src/beat_engine/julia_local/**') }}
+          restore-keys: |
+            julia-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.julia.outputs.julia-version }}-${{ github.job }}-
       - run: python -m pip install -e .
       - run: python -m beat_engine instantiate --backend cpu
       - run: julia --threads=2 --startup-file=no --project=src/beat_engine/julia_local src/beat_engine/julia_local/scripts/benchmark_sweep.jl --steps 8 --min-freq 100 --max-freq 20000 --eval-points 74 --warmups 0 --repetitions 1 --json results/ci_sweep.json

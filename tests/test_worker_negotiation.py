@@ -29,12 +29,93 @@ def payload():
     return json.loads((CONTRACT / "example-exterior-request.json").read_text())
 
 
+def enable_wall_loss(payload):
+    system = payload["compiled_system"]
+    system["regions"][0]["kind"] = "bounded_air"
+    wall = copy.deepcopy(system["boundaries"][0])
+    wall.update(id="boundary:wall", kind="rigid", parameters={"thermoviscous_wall_losses": "thin_boundary_layer"})
+    wall["group"]["tag"] = 3
+    system["boundaries"].append(wall)
+    return wall
+
+
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+@pytest.mark.parametrize("advertised", [None, [], ["future_value"]])
+def test_thermoviscous_model_requires_explicit_capability(ready, payload, advertised, capability):
+    wall = enable_wall_loss(payload)
+    if advertised is None:
+        ready.pop(capability)
+    else:
+        ready[capability] = advertised
+    with pytest.raises(WorkerCompatibilityError, match="thermoviscous wall loss model"):
+        negotiate_submission(ready, payload, "solve")
+    wall["parameters"]["thermoviscous_wall_losses"] = "off"
+    negotiate_submission(ready, payload, "solve")
+
+
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+def test_thermoviscous_capability_accepts_enabled_model_and_rejects_invalid_handshake(ready, payload, capability):
+    enable_wall_loss(payload)
+    negotiate_submission(ready, payload, "solve")
+    ready[capability] = "thin_boundary_layer"
+    with pytest.raises(WorkerCompatibilityError, match=f"invalid {capability}"):
+        negotiate_submission(ready, payload, "solve")
+
+
+@pytest.mark.parametrize("capability", ["fem_wall_loss_models", "fem_wall_loss_scopes"])
+def test_thermoviscous_incompatible_request_never_reaches_worker(tmp_path, ready, payload, capability):
+    ready.pop(capability)
+    enable_wall_loss(payload)
+    worker, received = fake_worker(tmp_path, ready)
+    path = tmp_path / "thermoviscous.json"
+    path.write_text(json.dumps(payload))
+    try:
+        with pytest.raises(WorkerCompatibilityError, match="thermoviscous wall loss model"):
+            worker.submit(path)
+        assert not received.exists()
+    finally:
+        worker.terminate()
+
+
 def test_selects_current_formats_and_accepts_future_advertised_versions(ready, payload):
     ready["contracts"]["system_result"].append(3)
     ready["future_extension"] = True
     assert negotiate_submission(ready, payload, "solve") == {"protocol_version": 1, "result_schema_version": 2}
     field = {"binary_array_schema_version": 1, "bem_backend": "cpu", "precision": "float32"}
     assert negotiate_submission(ready, field, "bem_field") == {"protocol_version": 1, "field_array_schema_version": 1}
+
+
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "rocm"])
+def test_gradient_field_requires_explicit_backend_capability(ready, backend):
+    ready["backends"][backend] = {"available": True}
+    field = {
+        "binary_array_schema_version": 1,
+        "bem_backend": backend,
+        "precision": "float64",
+        "field_quantity": "pressure_gradient_v1",
+    }
+    with pytest.raises(WorkerCompatibilityError, match="field quantity"):
+        negotiate_submission(ready, field, "bem_field")
+    ready["field_quantities"] = {backend: ["pressure", "pressure_gradient_v1"]}
+    assert negotiate_submission(ready, field, "bem_field")["field_array_schema_version"] == 1
+
+
+@pytest.mark.parametrize("capabilities", [None, [], "pressure_gradient_v1", {"cpu": "pressure_gradient_v1"}])
+def test_gradient_field_rejects_malformed_capabilities(ready, capabilities):
+    ready["field_quantities"] = capabilities
+    field = {
+        "binary_array_schema_version": 1,
+        "bem_backend": "cpu",
+        "precision": "float64",
+        "field_quantity": "pressure_gradient_v1",
+    }
+    with pytest.raises(WorkerCompatibilityError, match="invalid field_quantities"):
+        negotiate_submission(ready, field, "bem_field")
+    ready["field_quantities"] = {"cpu": ["pressure", "pressure_gradient_v1"]}
+    assert negotiate_submission(ready, field, "bem_field")["field_array_schema_version"] == 1
+    field["field_quantity"] = "future_gradient"
+    with pytest.raises(WorkerCompatibilityError, match="field quantity"):
+        negotiate_submission(ready, field, "bem_field")
 
 
 def test_axial_source_requires_explicit_worker_capability(ready, payload):
@@ -88,7 +169,7 @@ def test_missing_profiles_preserves_old_worker_normal_fallback(ready, payload):
 
 
 @pytest.mark.parametrize("kind", ["interior_fem", "coupled_fem_bem_lem"])
-def test_rigid_ideal_source_rejects_bounded_regions_before_submission(ready, payload, kind):
+def test_rigid_ideal_source_rejects_interior_boundaries_before_submission(ready, payload, kind):
     system = payload["compiled_system"]
     system["contract_version"] = 2
     system["components"][0]["parameters"] = {"motion_profile": "rigid_translation", "motion_axis": [1, 2, 3]}
@@ -98,8 +179,31 @@ def test_rigid_ideal_source_rejects_bounded_regions_before_submission(ready, pay
         interior = copy.deepcopy(system["regions"][0])
         interior.update(id="region:interior", kind="bounded_air")
         system["regions"].append(interior)
-    with pytest.raises(WorkerCompatibilityError, match="exterior BEM solve"):
+        system["boundaries"][0]["region_id"] = interior["id"]
+    with pytest.raises(WorkerCompatibilityError, match="exterior-only boundary assignments"):
         negotiate_submission(ready, payload, "solve")
+
+
+@pytest.mark.parametrize("profiles", [None, {}, "rigid_translation", [1], [""]])
+def test_rejects_malformed_coupled_source_profiles(ready, profiles):
+    ready["coupled_exterior_source_profiles"] = profiles
+    with pytest.raises(WorkerCompatibilityError, match="coupled_exterior_source_profiles"):
+        validate_worker_ready(ready)
+
+
+def test_coupled_exterior_axial_source_requires_worker_capability(ready, payload):
+    system = payload["compiled_system"]
+    system["contract_version"] = 2
+    system["components"][0]["parameters"] = {"motion_profile": "rigid_translation", "motion_axis": [0, 0, 1]}
+    interior = copy.deepcopy(system["regions"][0])
+    interior.update(id="region:interior", kind="bounded_air")
+    system["regions"].append(interior)
+    assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
+    ready.pop("coupled_exterior_source_profiles")
+    with pytest.raises(WorkerCompatibilityError, match="restart the worker"):
+        negotiate_submission(ready, payload, "solve")
+    system["components"][0]["parameters"] = {}
+    assert negotiate_submission(ready, payload, "solve")["result_schema_version"] == 2
 
 
 @pytest.mark.parametrize("version", [None, True, 1.0, 2, "1"])

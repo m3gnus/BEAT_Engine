@@ -64,12 +64,22 @@ names, never by generated names, and the keyword body through
 Left out on purpose: the wire parser's stateless generators, LLVM/ghost-type
 compiler helpers, Metal broadcast internals and shutdown/archive callbacks, which
 have no robust structural handle. With it, the first request falls to 3.9 +
-4.7-4.9 s on the same SAWMOD measurement. `compiled_metal_worker_tests.jl` and
-`metal_host_tests.jl` check that every entry still `precompile`s; because that
-cannot show an entry still matches the production types, the hardware gate
-`metal_coupled_precompile_coverage_tests.jl` runs the coupled request with Metal
-BEM in a fresh worker under `--trace-compile` and fails when coupled-path
-compilation exceeds `BLAB_COUPLED_COMPILE_BUDGET_MS` (1,500 ms).
+4.7-4.9 s on the same SAWMOD measurement. Pipelined frequencies (after the
+coupled sweep pipeline starts) pass the driver's producer closure as
+`bem_operators` and compile that call once; they are not in the inventory.
+
+When a closure's captured fields no longer match (the source changed), the
+package build warns, names the capture set and skips the entries that depend on
+it; it never fails the build. The strict check runs in CI:
+`compiled_metal_worker_tests.jl` (macOS job, no GPU needed) requires every
+closure to resolve and every entry to `precompile`, as `metal_host_tests.jl` does
+for the runtime list. Matching a closure is not the same as matching what the
+worker calls, so hardware qualification (`scripts/qualify_accelerator.py`) also
+runs `metal_coupled_precompile_coverage_tests.jl`: the coupled request with Metal
+BEM in a fresh worker under `--trace-compile`, failing when coupled-path
+compilation exceeds `BLAB_COUPLED_COMPILE_BUDGET_MS` (1,500 ms), with a
+source-fallback run that must exceed it. The budget catches a lost inventory
+section (seconds), not a single small closure; the CI check covers those.
 
 `MetalHostPrecompile.jl` additionally calls `precompile(f, argtypes)` for the
 Float32 native exterior path: fused assembly and gather orchestration, host

@@ -30,11 +30,7 @@ end
 # invalidates its cached run_worker call graph when Metal's extensions load.
 # Other backends and the explicit include fallback retain their existing order.
 if BEAT_COMPILED_BUNDLE_NAME === :BeatEngineCompiledMetalBundle && get(ENV, "BLAB_BEAT_ENGINE_BUNDLE", "1") != "0"
-    try
-        @eval import Metal
-    catch
-        # An unresolved environment still takes the existing fallback below.
-    end
+    @eval import Metal
 end
 
 using JSON
@@ -47,6 +43,7 @@ else
         @eval using $BEAT_COMPILED_BUNDLE_NAME
         @eval $BEAT_COMPILED_BUNDLE_NAME
     catch exception
+        BEAT_COMPILED_BUNDLE_NAME === :BeatEngineCompiledMetalBundle && rethrow()
         BEAT_COMPILED_BUNDLE_ERROR[] = sprint(showerror, exception)
         @warn "BEAT compiled bundle load failed; using source driver" bundle=BEAT_COMPILED_BUNDLE_NAME exception
         nothing

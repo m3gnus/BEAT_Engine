@@ -112,7 +112,7 @@ uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 version = "1.11.0"
 
 [[deps.BeatEngineRocmBundle]]
-deps = ["AMDGPU", "JSON", "LinearAlgebra", "PrecompileTools", "Printf", "SparseArrays", "StaticArrays", "Statistics"]
+deps = ["AMDGPU", "JSON", "LinearAlgebra", "PrecompileTools", "Printf", "SHA", "Serialization", "SparseArrays", "StaticArrays", "Statistics"]
 path = "../julia_engine/BeatEngineRocmBundle"
 uuid = "4dcecca2-7a78-4163-9eba-4966e709c0e0"
 version = "0.1.0"

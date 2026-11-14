@@ -167,7 +167,16 @@
           "$ref": "#/$defs/group"
         },
         "parameters": {
-          "type": "object"
+          "type": "object",
+          "properties": {
+            "thermoviscous_wall_losses": {
+              "type": "string",
+              "enum": [
+                "off",
+                "thin_boundary_layer"
+              ]
+            }
+          }
         }
       },
       "required": [

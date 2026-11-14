@@ -57,14 +57,26 @@ checkout's meshes, so it is not committed here.
   section can cost another; the totals show it.
 - Memory: peak over the sweep and growth over the warmed worker. On macOS this
   is `phys_footprint`, which includes Metal buffers in unified memory; RSS does
-  not. Linux reports RSS. Unsupported platforms, including Windows, store
-  `null` memory measurements and display `unavailable`, rather than zero.
+  not. Linux reports RSS. Windows samples current process working-set bytes
+  using [GetProcessMemoryInfo](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getprocessmemoryinfo).
+  These Windows values measure resident host memory, not dedicated GPU VRAM.
+  The peak is the maximum sampled within each sweep, not the process lifetime
+  high-water mark; short spikes between 20 ms samples can be missed. Reports
+  label the metric, process scope, and sampling interval. Unsupported platforms
+  or failed reads store `null` and display `unavailable`, rather than zero.
 - Accuracy against a reference: Float64 CPU on `main` for compiled requests,
   `main` CPU for source requests (Float32 only). Relative L2 over each output,
   and the worst dB error within 30 dB of each output's peak. The comparison
   checks every repeat and reports the worst of each metric across repeats.
   Quantities, frequencies, shapes and lengths must match the reference, and
   values must be finite; incomplete or invalid outputs stop the comparison.
+  Benchmark output-key version 2 retains quantity and output ID, sweep index,
+  and the full requested frequency. This preserves multiple pressure outputs,
+  repeated frequencies, and closely spaced frequencies. Returned Float32
+  frequencies are checked against their requested slot before canonicalization.
+  Capture both candidate and reference with the same benchmark-tool version;
+  older reports remain readable together but cannot be compared to version 2
+  output keys. Re-capture old references rather than discard output identities.
 
 ## Overlap, pipelining and offload
 

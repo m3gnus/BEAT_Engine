@@ -22,6 +22,7 @@ using Statistics
 using StaticArrays
 
 include(joinpath(@__DIR__, "compiled_ground_contract.jl"))
+include(joinpath(@__DIR__, "worker_backend_availability.jl"))
 
 function emit_event(event_type::String; kwargs...)
     payload = Dict{String,Any}("type" => event_type)
@@ -31,6 +32,10 @@ function emit_event(event_type::String; kwargs...)
     payload["phasor_convention"] = phasor_convention()
     if event_type == "ready"
         payload["phasor_conventions"] = [NEGATIVE_TIME_PHASOR, POSITIVE_TIME_PHASOR]
+        payload["deploy_solver_backends"] = ["cpu", "cuda", "metal", "rocm"]
+        # Supported solve paths are not a claim about this worker/device. Probe
+        # at startup, outside precompilation, and report actual availability.
+        payload["backends"] = worker_backend_availability()
     elseif event_type == "result" && haskey(payload, "result")
         get!(payload["result"], "diagnostics", Dict{String,Any}())["phasor_convention"] = phasor_convention()
     end
@@ -117,8 +122,8 @@ function regular_quadrature_mode_from_config(config, beat_backend::Symbol)
     default_mode = "fixed"
     mode = lowercase(strip(String(get_value(config, "regular_quadrature_mode", get_value(config, "quadrature_mode", default_mode)))))
     mode in ("fixed", "wavelength") || error("Unsupported regular quadrature mode: $(mode). Expected fixed or wavelength.")
-    if beat_backend != :cpu && mode == "wavelength"
-        error("Wavelength-driven regular quadrature is currently implemented only for the BEAT CPU backend.")
+    if !(beat_backend in (:cpu, :rocm)) && mode == "wavelength"
+        error("Wavelength-driven regular quadrature is implemented for the BEAT CPU and ROCm backends.")
     end
     return mode
 end
@@ -802,8 +807,6 @@ include(joinpath(@__DIR__, "deploy_solver.jl"))
 
 function solve_request(request)
     convention = get_value(request, "phasor_convention", get_value(get_value(request, "config", Dict()), "phasor_convention", NEGATIVE_TIME_PHASOR))
-    convention == POSITIVE_TIME_PHASOR && beat_backend_from_request(request) == :rocm &&
-        error("Positive-time ROCm solves require hardware qualification; use CPU, CUDA, or Metal.")
     return with_phasor_convention(convention) do
         solve_request_with_convention(request)
     end
@@ -880,8 +883,8 @@ function solve_request_impl(request)
     symmetry_mode = symmetry_mode_from_config(config)
     beat_backend = beat_backend_from_request(request)
     near_enabled = Bool(get_value(config, "near_correction_enabled", false))
-    near_enabled && beat_backend != :cpu && error(
-        "Source-request near-singular correction is supported only on the CPU backend.",
+    near_enabled && !(beat_backend in (:cpu, :rocm)) && error(
+        "Source-request near-singular correction is supported only on CPU and ROCm backends.",
     )
     rocm_assembly_mode = beat_backend == :rocm ? BeatEngineCore._normalized_rocm_assembly_mode(
         get_value(config, "rocm_assembly_mode", nothing),
@@ -998,6 +1001,7 @@ function solve_request_impl(request)
     rocm_solve_identity_cache = nothing
     field_cache = cpu_field_cache
     regular_rule_cache = Dict{Int,Any}(base_regular_order => rule)
+    rocm_quadrature_caches = Dict{Int,Any}()
     identity_cache = Dict{Int,Any}(base_regular_order => (identity_p1_p1, identity_p1_dp0))
     cpu_field_cache_by_order = Dict{Int,Any}(base_regular_order => cpu_field_cache)
     cpu_assembly_cache_by_order = Dict{Int,Any}()
@@ -1181,7 +1185,7 @@ function solve_request_impl(request)
         omega = FloatType(2pi) * freq
         k = omega / sound_speed
         quadrature_selection = regular_quadrature_selection(config, mesh, freq, sound_speed, base_regular_order, regular_quadrature_mode)
-        selected_rule = if beat_backend == :cpu
+        selected_rule = if beat_backend in (:cpu, :rocm)
             get!(regular_rule_cache, quadrature_selection.order) do
                 triangle_rule(FloatType, quadrature_selection.order)
             end
@@ -1191,8 +1195,19 @@ function solve_request_impl(request)
         selected_identity_p1_p1 = identity_p1_p1
         selected_identity_p1_dp0 = identity_p1_dp0
         selected_field_cache = field_cache
+        selected_device_cache = device_cache
+        selected_rocm_identity_cache = rocm_solve_identity_cache
         selected_cpu_assembly_cache = nothing
-        if beat_backend == :cpu
+        if beat_backend == :rocm && quadrature_selection.order != base_regular_order
+            selected_cache = get!(rocm_quadrature_caches, quadrature_selection.order) do
+                BeatEngineCore.build_rocm_quadrature_cache(mesh, p1_space, dp0_space, selected_rule;
+                    singular_order, symmetry_mode=Symbol(symmetry_mode), assembly_mode=rocm_assembly_mode)
+            end
+            selected_identity_p1_p1, selected_identity_p1_dp0 = selected_cache.identity
+            selected_device_cache = selected_cache.device_cache
+            selected_field_cache = selected_cache.field_cache
+            selected_rocm_identity_cache = selected_cache.device_identity_cache
+        elseif beat_backend == :cpu
             selected_identity = get!(identity_cache, quadrature_selection.order) do
                 (
                     assemble_l2_identity_matrix(mesh, p1_space, dp0_space, selected_rule, :p1, :p1; symmetry_mode=Symbol(symmetry_mode)),
@@ -1269,7 +1284,7 @@ function solve_request_impl(request)
                     skip_singular=false,
                     singular_order=singular_order,
                     backend=beat_backend,
-                    device_cache=device_cache,
+                    device_cache=selected_device_cache,
                     return_device=beat_backend != :cpu,
                     accelerator_quadrature=beat_backend != :cpu,
                     singular_cache=singular_cache,
@@ -1352,7 +1367,7 @@ function solve_request_impl(request)
                         k,
                         cpu_solve_system=cpu_solve_system,
                         cuda_solve_identity_cache=cuda_solve_identity_cache,
-                        rocm_solve_identity_cache=rocm_solve_identity_cache,
+                        rocm_solve_identity_cache=selected_rocm_identity_cache,
                     )
                 end
             end
@@ -1508,6 +1523,9 @@ function solve_request_impl(request)
         if rocm_solve_identity_cache !== nothing
             release_rocm_burton_miller_identity_cache!(rocm_solve_identity_cache)
         end
+        for cache in values(rocm_quadrature_caches)
+            BeatEngineCore.release_rocm_quadrature_cache!(cache)
+        end
         if beat_backend == :rocm
             release_rocm_field_evaluation_cache!(field_cache)
         end
@@ -1577,4 +1595,3 @@ function main(args = ARGS)
         fail!(sprint(showerror, exc))
     end
 end
-

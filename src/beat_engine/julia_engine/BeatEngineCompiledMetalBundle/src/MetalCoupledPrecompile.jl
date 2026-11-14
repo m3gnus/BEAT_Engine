@@ -35,6 +35,7 @@ function metal_coupled_types()
         bulk_loss_mass=SparseArrays.SparseMatrixCSC{Float32, Int},
         bulk_loss_factor_by_vertex=Vector{Float32},
         wall_impedance_operators=Vector{Any},
+        thermoviscous_operator=Nothing,
         interface_operators=coupled.InterfaceOperators{Float32},
         p1=core.P1Space,
         dp0=core.DP0Space,
@@ -315,11 +316,14 @@ function metal_coupled_host_signatures()
         quadrature_order=Int, regular_quadrature_order=Int, singular_order=Int,
         cache=types.cache, validation_diagnostics=Bool, retain_interface_radiation=Bool,
         symmetry_mode=Symbol, bulk_loss_factor_by_vertex=Vector{Float32},
-        wall_impedances=Vector{NamedTuple},
+        wall_impedances=Vector{NamedTuple}, thermoviscous_walls=Vector{NamedTuple},
         transducers=Vector{coupled.ElectrodynamicTransducer{Float32}},
         transducer_operators=types.transducer_operators,
         prescribed_bem_normal_velocity=SparseMatrixCSC{Float32,Int},
         allow_transducer_condensation=Bool, bem_operators=Nothing)
+    # `bem_operators=Nothing` is every frequency the coupled sweep pipeline has not
+    # started on (at least the first two of a sweep). Pipelined frequencies pass the
+    # driver's producer closure and compile that call on the first one; not covered.
     add(cc.solve_condensed_coupled_excitations, (types.system, Vector{NamedTuple});
         reconstruct_interior=Bool)
     add(cc._fem_system_float64,
@@ -418,8 +422,11 @@ end
 # checked too. Aliased module bindings are deduplicated. Anything but exactly
 # one match returns `nothing` with a warning naming the capture set, never a
 # guess based on a gensym number or on enumeration order: the inventory then
-# skips that entry instead of failing the package build, and
-# metal_coupled_precompile_coverage_tests.jl reports the lost coverage.
+# skips that entry instead of failing the package build. The strict check is
+# compiled_metal_worker_tests.jl, which requires every closure to resolve (it runs
+# in the macOS CI job without a GPU); metal_coupled_precompile_coverage_tests.jl,
+# in hardware qualification (scripts/qualify_accelerator.py), measures the
+# first-request compilation that remains.
 function metal_captured_closure_type(mod::Module, captures::NamedTuple)
     candidates = Set{Type}()
     for name in names(mod; all=true)
@@ -433,11 +440,14 @@ function metal_captured_closure_type(mod::Module, captures::NamedTuple)
             all(name -> haskey(captures, name), captured_names) || continue
         fields = fieldtypes(T)
         parameters = Any[]
+        bindable = true
         for parameter in T.parameters
             index = findfirst(field -> field === parameter, fields)
-            index === nothing && error("Closure parameter has no captured field: $parameter")
+            # A parameter not carried by a captured field cannot be bound structurally: not a match.
+            index === nothing && (bindable = false; break)
             push!(parameters, getproperty(captures, captured_names[index]))
         end
+        bindable || continue
         concrete = isempty(parameters) ? wrapper : Core.apply_type(wrapper, parameters...)
         all(name -> fieldtype(concrete, name) === getproperty(captures, name), captured_names) || continue
         push!(candidates, concrete)

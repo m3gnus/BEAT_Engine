@@ -26,6 +26,8 @@ function _assemble_regular_galerkin_operators_rocm_native(
     timing,
     singular_cache,
     rocm_singular_cache,
+    near_correction_cache,
+    image_near_correction_cache,
     symmetry_mode::Symbol,
 ) where {T<:AbstractFloat}
     normalized_mode = normalized_symmetry_mode(symmetry_mode)
@@ -119,6 +121,11 @@ function _assemble_regular_galerkin_operators_rocm_native(
         timing !== nothing && (timing["rocm_native_image_singular_kernel"] = image_elapsed)
         image_singular_pairs = native_cache.image_singular_pair_count
     end
+    near_caches = (_near_correction_cache_tuple(near_correction_cache)...,
+                   _near_correction_cache_tuple(image_near_correction_cache)...)
+    near_pair_count = sum(c.pair_count for c in near_caches; init=0)
+    near_elapsed = @elapsed _add_rocm_near_corrections!(operators, native_cache, k, rule, near_caches)
+    timing !== nothing && (timing["rocm_native_near_corrections"] = near_elapsed)
     weight_elapsed = @elapsed _apply_rocm_operator_p1_row_weights!(operators, mesh, normalized_mode)
     timing !== nothing && (timing["rocm_native_symmetry_row_weights"] = weight_elapsed)
     total_pairs = length(indices) * length(indices)
@@ -132,6 +139,8 @@ function _assemble_regular_galerkin_operators_rocm_native(
             singular_pairs=singular_pairs,
             skipped_pairs=skip_singular ? adjacent_pairs : 0,
             image_singular_pairs=image_singular_pairs,
+            near_pair_count=near_pair_count,
+            near_pair_quadrature_order=maximum((c.correction_order for c in near_caches); init=0),
             on_gpu=true,
             gpu_backend=:rocm,
             host_staged_assembly=false,
@@ -166,6 +175,8 @@ function assemble_regular_galerkin_operators_rocm_regular(
     timing=nothing,
     singular_cache=nothing,
     rocm_singular_cache=nothing,
+    near_correction_cache=nothing,
+    image_near_correction_cache=nothing,
     assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
@@ -189,6 +200,8 @@ function assemble_regular_galerkin_operators_rocm_regular(
             timing=timing,
             singular_cache=singular_cache,
             rocm_singular_cache=rocm_singular_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=symmetry_mode,
         )
     end
@@ -210,6 +223,8 @@ function assemble_regular_galerkin_operators_rocm_regular(
             threaded=true,
             singular_cache=singular_cache,
             cpu_cache=host_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=normalized_mode,
         )
     end

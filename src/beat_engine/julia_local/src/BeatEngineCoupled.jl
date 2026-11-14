@@ -35,6 +35,12 @@ export VolumeMesh,
     blend_fem_mass_matrix,
     assemble_fem_dynamic_stiffness,
     assemble_boundary_mass_matrix,
+    assemble_boundary_tangential_stiffness,
+    prepare_thermoviscous_operator,
+    thermoviscous_surface_operator,
+    thermoviscous_coefficients,
+    add_thermoviscous_terms,
+    thermoviscous_diagnostics,
     miki_rigid_backed_surface_admittance,
     assemble_prescribed_velocity_load,
     sealed_cavity_modes,
@@ -704,6 +710,8 @@ function assemble_boundary_mass_matrix(
     return sparse(rows, cols, values, length(mesh.vertices), length(boundary_vertex_indices))
 end
 
+include("BeatEngineThermoviscous.jl")
+
 function assemble_prescribed_velocity_load(
     mesh::VolumeMesh{T},
     boundary_tag::Int,
@@ -1128,6 +1136,7 @@ function prepare_coupled_cache(
     coupled_bem_assembly::Symbol=:auto,
     bulk_loss_factor_by_vertex=zeros(T, length(fem_mesh.vertices)),
     wall_impedances=NamedTuple[],
+    thermoviscous_walls=NamedTuple[],
 ) where {T<:AbstractFloat}
     is_quadratic(fem_mesh) && error(
         "Quadratic tetrahedra are currently supported only by the pure interior FEM solve.",
@@ -1163,6 +1172,8 @@ function prepare_coupled_cache(
         end
         for spec in wall_impedances
     ]
+    thermoviscous_operator = prepare_thermoviscous_operator(
+        fem_mesh, thermoviscous_walls; symmetry_mode=normalized_symmetry)
     fem_matrix_cache_s = (time_ns() - fem_matrix_started) / 1.0e9
 
     interface_started = time_ns()
@@ -1316,6 +1327,10 @@ function prepare_coupled_cache(
                 build_sparse_cache(operator.matrix)
                 for operator in wall_impedance_operators
             ],
+            thermoviscous=isnothing(thermoviscous_operator) ? [] : [
+                build_sparse_cache(thermoviscous_operator.stiffness),
+                build_sparse_cache(thermoviscous_operator.mass),
+            ],
             fem_load=build_sparse_cache(interface_operators.fem_load),
             fem_trace=build_sparse_cache(interface_operators.fem_trace),
             bem_trace=build_sparse_cache(interface_operators.bem_trace),
@@ -1359,6 +1374,7 @@ function prepare_coupled_cache(
         bulk_loss_mass=bulk_loss_mass,
         bulk_loss_factor_by_vertex=T.(collect(bulk_loss_factor_by_vertex)),
         wall_impedance_operators=wall_impedance_operators,
+        thermoviscous_operator=thermoviscous_operator,
         interface_operators=interface_operators,
         p1=p1,
         dp0=dp0,
@@ -1415,7 +1431,7 @@ function release_coupled_cache!(cache)
         release_rocm_burton_miller_identity_cache!(cache.device_identity_cache)
         BeatEngineCore.amdgpu_module().unsafe_free!(cache.device_bem_flux)
         for (name, sparse_cache) in pairs(cache.device_sparse_blocks)
-            if name == :wall_impedance
+            if name in (:wall_impedance, :thermoviscous)
                 for wall_cache in sparse_cache
                     release_rocm_sparse_scatter_cache!(wall_cache)
                 end
@@ -1492,7 +1508,7 @@ function release_coupled_cache!(cache)
     cache.device_bem_flux === nothing || BeatEngineCore.cuda_module().unsafe_free!(cache.device_bem_flux)
     BeatEngineCore.release_cuda_bem_flux_cache!(cache.device_bem_flux_sparse)
     for (name, sparse_cache) in pairs(cache.device_sparse_blocks)
-        if name == :wall_impedance
+        if name in (:wall_impedance, :thermoviscous)
             for wall_cache in sparse_cache
                 release_cuda_sparse_scatter_cache!(wall_cache)
             end
@@ -1998,10 +2014,65 @@ function _blocked_umfpack_schur_complement(
     )
 end
 
+# Shared host-side low-rank terms for eliminating transducer surface vertices.
+# Preserve nonconjugating transpose: these complex acoustic operators are not
+# Hermitian. Keeping this algebra shared avoids backend-specific force signs.
+function _condensed_transducer_motion_fields(
+    factorization,
+    interior_vertices,
+    retained,
+    interior_retained,
+    retained_interior,
+    fem_count::Int,
+    motion_surface,
+    motion_force,
+)
+    isnothing(motion_surface) == isnothing(motion_force) ||
+        error("Transducer condensation needs both the motion load and the force operator.")
+    interior_count = length(interior_vertices)
+    return if !isnothing(motion_surface)
+        surface = SparseMatrixCSC{ComplexF64,Int}(motion_surface)
+        force = SparseMatrixCSC{ComplexF64,Int}(motion_force)
+        size(surface, 1) == fem_count && size(force) == size(surface) ||
+            error("Transducer motion operators must have one row per FEM vertex.")
+        surface_interior = surface[interior_vertices, :]
+        force_interior = force[interior_vertices, :]
+        motion_gamma = Matrix(surface[retained, :])
+        force_gamma = Matrix(force[retained, :])
+        motion_solution = zeros(ComplexF64, interior_count, size(surface, 2))
+        force_solution = zeros(ComplexF64, interior_count, size(surface, 2))
+        if interior_count > 0
+            motion_solution = factorization \ Matrix(surface_interior)
+            force_solution = transpose(factorization) \ Matrix(force_interior)
+            mul!(motion_gamma, retained_interior, motion_solution, -one(ComplexF64), one(ComplexF64))
+            mul!(force_gamma, transpose(interior_retained), force_solution, -one(ComplexF64), one(ComplexF64))
+        end
+        (
+            motion_interior=surface_interior,
+            motion_solution=motion_solution,
+            force_solution=force_solution,
+            motion_gamma=motion_gamma,
+            force_gamma=force_gamma,
+            motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+        )
+    else
+        (
+            motion_interior=nothing,
+            motion_solution=nothing,
+            force_solution=nothing,
+            motion_gamma=nothing,
+            force_gamma=nothing,
+            motion_force_correction=nothing,
+        )
+    end
+end
+
 function _build_rocm_hybrid_fem_condensation(
     fem_system::SparseMatrixCSC{Complex{T}},
     interface_operators::InterfaceOperators{T},
-    retained_vertices,
+    retained_vertices;
+    motion_surface=nothing,
+    motion_force=nothing,
 ) where {T<:AbstractFloat}
     amdgpu = BeatEngineCore.amdgpu_module()
     fem_count = size(fem_system, 1)
@@ -2052,6 +2123,13 @@ function _build_rocm_hybrid_fem_condensation(
         )
     end
     schur_extraction_s = (time_ns() - schur_started) / 1.0e9
+    transducer_started = time_ns()
+    motion_fields = _condensed_transducer_motion_fields(
+        factorization, interior_vertices, retained_vertices,
+        interior_to_retained, retained_to_interior, fem_count,
+        motion_surface, motion_force,
+    )
+    transducer_solves_s = (time_ns() - transducer_started) / 1.0e9
 
     upload_started = time_ns()
     device_schur = amdgpu.ROCArray(Complex{T}.(schur_result.schur))
@@ -2059,6 +2137,8 @@ function _build_rocm_hybrid_fem_condensation(
     upload_s = (time_ns() - upload_started) / 1.0e9
     return (
         backend=:rocm_hybrid,
+        transducer_condensed=!isnothing(motion_surface),
+        motion_fields...,
         factorization=factorization,
         device_schur=device_schur,
         interior_vertices=interior_vertices,
@@ -2077,6 +2157,7 @@ function _build_rocm_hybrid_fem_condensation(
             schur_densify_s=schur_result.densify_s,
             schur_solve_s=schur_result.solve_s,
             schur_apply_s=schur_result.apply_s,
+            transducer_solves_s=transducer_solves_s,
             upload_s=upload_s,
         ),
     )
@@ -2086,6 +2167,56 @@ function _release_rocm_hybrid_fem_condensation!(condensation)
     isnothing(condensation) && return nothing
     isnothing(condensation.factorization) || finalize(condensation.factorization)
     BeatEngineCore.amdgpu_module().unsafe_free!(condensation.device_schur)
+    return nothing
+end
+
+# Automatic selection preserves caches built with the former retained-surface
+# layout. Explicit on still requires a matching interface-only cache.
+function _rocm_transducer_condensation_enabled(
+    backend, static_condensation, transducers; cache=nothing, interface_vertices=nothing,
+)
+    backend == :rocm && static_condensation && !isempty(transducers) || return false
+    value = lowercase(strip(get(ENV, "BLAB_COUPLED_TRANSDUCER_CONDENSATION", "auto")))
+    value in ("0", "off", "false") && return false
+    value in ("1", "on", "true") && return true
+    if value == "auto"
+        return isnothing(cache) || (!isnothing(interface_vertices) &&
+            cache.retained_fem_vertices == sort(unique(interface_vertices)))
+    end
+    error("BLAB_COUPLED_TRANSDUCER_CONDENSATION must be off, on, or auto.")
+end
+
+"""Own replay storage independently of the temporary coupled-assembly blocks."""
+function _build_interface_radiation_replay(bem_lhs, interface_block, backend::Symbol)
+    if backend != :cuda
+        return (backend=:cpu, factorization=lu(Array(bem_lhs)), interface_block=Array(interface_block))
+    end
+    cuda = BeatEngineCore.cuda_module()
+    factors = copy(bem_lhs)
+    factorization = block = nothing
+    success = false
+    try
+        factorization = lu!(factors)
+        block = copy(interface_block)
+        cuda.synchronize()
+        success = true
+        return (backend=:cuda, factorization=factorization, interface_block=block)
+    finally
+        if !success
+            cuda.unsafe_free!(factors)
+            isnothing(factorization) || cuda.unsafe_free!(factorization.ipiv)
+            isnothing(block) || cuda.unsafe_free!(block)
+        end
+    end
+end
+
+function _release_interface_radiation_replay!(replay)
+    if !isnothing(replay) && get(replay, :backend, :cpu) == :cuda
+        cuda = BeatEngineCore.cuda_module()
+        cuda.unsafe_free!(replay.factorization.factors)
+        cuda.unsafe_free!(replay.factorization.ipiv)
+        cuda.unsafe_free!(replay.interface_block)
+    end
     return nothing
 end
 
@@ -2107,8 +2238,12 @@ function build_coupled_system(
     bulk_loss_factor::T=zero(T),
     bulk_loss_factor_by_vertex=nothing,
     wall_impedances=NamedTuple[],
+    thermoviscous_walls=NamedTuple[],
     transducers::AbstractVector{ElectrodynamicTransducer{T}}=ElectrodynamicTransducer{T}[],
     transducer_operators=nothing,
+    transducer_condensation::Bool=_rocm_transducer_condensation_enabled(
+        bem_backend, static_condensation, transducers;
+        cache=cache, interface_vertices=interface_map.fem_vertex_indices),
     prescribed_bem_normal_velocity=nothing,
     coupled_bem_assembly::Symbol=:auto,
     coupled_bem_image_fusion::Bool=true,
@@ -2123,6 +2258,8 @@ function build_coupled_system(
     static_condensation && validation_diagnostics && error(
         "FEM static condensation cannot be combined with full-matrix validation diagnostics.",
     )
+    transducer_condensation && !(bem_backend == :rocm && static_condensation) &&
+        error("Hybrid transducer condensation requires ROCm static condensation.")
     fem_stage_started = time_ns()
     resolved_transducer_operators = isnothing(transducer_operators) ?
                                     assemble_transducer_operators(
@@ -2135,9 +2272,10 @@ function build_coupled_system(
     else
         unique(findnz(resolved_transducer_operators.fem_surface)[1])
     end
-    retained_fem_vertices = sort(
-        unique(vcat(interface_map.fem_vertex_indices, transducer_fem_vertices)),
-    )
+    retained_fem_vertices = sort(unique(vcat(
+        interface_map.fem_vertex_indices,
+        transducer_condensation ? Int[] : transducer_fem_vertices,
+    )))
     prepared = isnothing(cache) ? prepare_coupled_cache(
         fem_mesh,
         bem_mesh,
@@ -2154,6 +2292,7 @@ function build_coupled_system(
             bulk_loss_factor_by_vertex
         ),
         wall_impedances=wall_impedances,
+        thermoviscous_walls=thermoviscous_walls,
     ) : cache
     prepared.bem_backend == bem_backend ||
         error("Coupled cache backend does not match requested BEM backend.")
@@ -2169,6 +2308,8 @@ function build_coupled_system(
         wavenumber;
         bulk_loss_mass=prepared.bulk_loss_mass,
     )
+    fem_system = add_thermoviscous_terms(
+        fem_system, prepared.thermoviscous_operator, frequency_hz, sound_speed, density)
     wall_admittances = Complex{T}[
         miki_rigid_backed_surface_admittance(
             frequency_hz,
@@ -2314,11 +2455,9 @@ function build_coupled_system(
                          zeros(Complex{T}, length(bem_mesh.vertices), 0) :
                          Complex{T}.(Array(bem_blocks.bem_prescribed_rhs))
     # Replay the frozen operating flux without changing the coupled state.
-    # Preserve host matrices before accelerator assembly storage is released.
-    interface_radiation_replay = retain_interface_radiation ? (
-        factorization=lu(Array(bem_lhs)),
-        interface_block=Array(bem_blocks.bem_interface_block),
-    ) : nothing
+    # Keep CUDA factors/operators resident; assembly frees its own copies below.
+    interface_radiation_replay = retain_interface_radiation ?
+        _build_interface_radiation_replay(bem_lhs, bem_blocks.bem_interface_block, linear_backend) : nothing
     bem_matrix_s = (time_ns() - bem_matrix_started) / 1.0e9
 
     condensation_started = time_ns()
@@ -2335,7 +2474,9 @@ function build_coupled_system(
         _build_rocm_hybrid_fem_condensation(
             fem_system,
             interface_operators,
-            retained_fem_vertices,
+            retained_fem_vertices;
+            motion_surface=transducer_condensation ? resolved_transducer_operators.fem_surface : nothing,
+            motion_force=transducer_condensation ? resolved_transducer_operators.fem_force : nothing,
         )
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
@@ -2420,6 +2561,13 @@ function build_coupled_system(
                     alpha=Complex{T}(0, -propagation_sign() * (wavenumber^2)),
                     add=true,
                 )
+                if !isnothing(prepared.thermoviscous_operator)
+                    tv = thermoviscous_coefficients(frequency_hz, sound_speed, density)
+                    for (block, coefficient) in zip(prepared.device_sparse_blocks.thermoviscous,
+                                                     (tv.viscous, tv.thermal))
+                        scatter_sparse!(d_coupled, block; alpha=coefficient, add=true)
+                    end
+                end
                 for (wall_cache, admittance) in zip(
                     prepared.device_sparse_blocks.wall_impedance,
                     wall_admittances,
@@ -2453,34 +2601,26 @@ function build_coupled_system(
                 alpha=-one(Complex{T}),
             )
             if transducer_count > 0
-                d_fem_motion = device_array(
-                    -normal_derivative_scale .* Complex{T}.(
-                        Matrix(
-                            resolved_transducer_operators.fem_surface[
-                                coupled_fem_vertices,
-                                :,
-                            ],
-                        )
-                    ),
-                )
-                d_fem_force = device_array(
-                    -Complex{T}.(
-                        transpose(
-                            Matrix(
-                                resolved_transducer_operators.fem_force[
-                                    coupled_fem_vertices,
-                                    :,
-                                ],
-                            ),
-                        )
-                    ),
-                )
+                fem_motion = transducer_condensation ? condensation.motion_gamma :
+                             Matrix(resolved_transducer_operators.fem_surface[coupled_fem_vertices, :])
+                fem_force = transducer_condensation ? condensation.force_gamma :
+                            Matrix(resolved_transducer_operators.fem_force[coupled_fem_vertices, :])
+                d_fem_motion = device_array(-normal_derivative_scale .* Complex{T}.(fem_motion))
+                d_fem_force = device_array(-Complex{T}.(transpose(fem_force)))
                 d_bem_force = device_array(
                     Complex{T}.(
                         transpose(Matrix(resolved_transducer_operators.bem_force))
                     ),
                 )
-                d_mechanical = device_array(Matrix(Diagonal(mechanical_impedance)))
+                mechanical_block = if transducer_condensation
+                    Complex{T}.(
+                        ComplexF64.(Matrix(Diagonal(mechanical_impedance))) .-
+                        ComplexF64(normal_derivative_scale) .* condensation.motion_force_correction
+                    )
+                else
+                    Matrix(Diagonal(mechanical_impedance))
+                end
+                d_mechanical = device_array(mechanical_block)
                 d_electrical = device_array(Matrix(Diagonal(electrical_impedance)))
                 d_force_factor = device_array(Matrix(Diagonal(Complex{T}.(force_factor))))
                 append!(
@@ -2563,6 +2703,13 @@ function build_coupled_system(
     elseif validation_diagnostics
         lu(coupled)
     elseif linear_backend == :rocm
+        if T == Float32
+            # Match the CPU policy for badly scaled pressure/flux/LEM blocks.
+            # Keep the factorization on the GPU and cast only returned traces.
+            promoted = ComplexF64.(coupled)
+            BeatEngineCore.amdgpu_module().unsafe_free!(coupled)
+            coupled = promoted
+        end
         rocm_dense_lu!(coupled)
     else
         lu!(coupled)
@@ -2592,6 +2739,7 @@ function build_coupled_system(
         formulation=formulation,
         condensation=condensation,
         condensation_timings=isnothing(condensation) ? nothing : condensation.timings,
+        transducer_condensation=transducer_condensation,
         fem_range=fem_range,
         gamma_range=gamma_range,
         retained_fem_vertices=retained_fem_vertices,
@@ -2630,6 +2778,7 @@ function build_coupled_system(
 end
 
 function release_coupled_system!(system)
+    _release_interface_radiation_replay!(system.interface_radiation_replay)
     if system.linear_backend in (:cuda, :rocm)
         accelerator = system.linear_backend == :cuda ?
                       BeatEngineCore.cuda_module() : BeatEngineCore.amdgpu_module()
@@ -2778,9 +2927,15 @@ function _solve_rocm_hybrid_condensed_excitations(
     host_rhs[system.gamma_range, :] = reduced_fem_rhs
     host_rhs[system.bem_range, :] = bem_rhs
     host_rhs[system.electrical_range, :] = electrical_rhs
+    if condensation.transducer_condensed && condensation.interior_count > 0
+        host_rhs[system.mechanical_range, :] .+= Complex{T}.(
+            transpose(condensation.force_solution) *
+            ComplexF64.(fem_rhs[condensation.interior_vertices, :])
+        )
+    end
     fem_rhs_condensation_s = (time_ns() - rhs_condensation_started) / 1.0e9
 
-    d_rhs = amdgpu.ROCArray(host_rhs)
+    d_rhs = amdgpu.ROCArray(eltype(system.factorization).(host_rhs))
     d_solution = nothing
     host_solution = nothing
     try
@@ -2801,6 +2956,11 @@ function _solve_rocm_hybrid_condensed_excitations(
             ComplexF64.(fem_rhs[condensation.interior_vertices, :]) .-
             condensation.interior_to_retained * ComplexF64.(retained_pressure)
         )
+        if condensation.transducer_condensed
+            interior_rhs .+= ComplexF64(neumann_scale(system.density, system.omega)) .* (
+                condensation.motion_interior * ComplexF64.(view(host_solution, system.mechanical_range, :))
+            )
+        end
         fem_pressure[condensation.interior_vertices, :] .= Complex{T}.(
             condensation.factorization \ interior_rhs
         )
@@ -2996,7 +3156,8 @@ function solve_coupled_excitations(system, excitations)
                       BeatEngineCore.cuda_module() : BeatEngineCore.amdgpu_module()
         device_array = system.linear_backend == :cuda ?
                        accelerator.CuArray : accelerator.ROCArray
-        d_rhs = device_array(rhs)
+        device_rhs = system.linear_backend == :rocm ? eltype(system.factorization).(rhs) : rhs
+        d_rhs = device_array(device_rhs)
         d_solution = nothing
         try
             d_solution = system.linear_backend == :rocm ?

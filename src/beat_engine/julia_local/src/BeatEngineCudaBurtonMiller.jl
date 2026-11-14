@@ -1,3 +1,23 @@
+# A scatter destination for an exact subset of DP0 columns. The regular,
+# singular, near and image kernels all use the same global scatter indices.
+# Device fields are converted explicitly; the owning arrays remain alive until
+# the synchronized assembly has completed.
+struct CudaRhsColumnTile{A,M}
+    values::A
+    column_map::M
+    row_count::Int
+end
+Base.ndims(::CudaRhsColumnTile) = 2
+Base.size(a::CudaRhsColumnTile, d::Int) = d == 1 ? a.row_count : length(a.column_map)
+@inline function _cuda_atomic_add!(a::CudaRhsColumnTile, index, value)
+    row = mod1(index, a.row_count)
+    column = a.column_map[(index - 1) ÷ a.row_count + 1]
+    if column > 0
+        _cuda_atomic_add!(a.values, row + (column - 1) * a.row_count, value)
+    end
+    return nothing
+end
+
 function _cuda_bm_identity_kernel!(
     matrix_re,
     matrix_im,
@@ -152,8 +172,9 @@ function _launch_cuda_bm_regular_transform!(
     transform::SymmetryTransform;
     skip_adjacent::Bool,
     rhs_only::Bool=false,
+    trial_indices=cache.trial_indices,
 ) where {T<:AbstractFloat}
-    total_pairs = length(cache.element_indices) * length(cache.element_indices)
+    total_pairs = length(cache.test_indices) * length(trial_indices)
     threads = 128
     blocks = min(cld(total_pairs, threads), 65_535)
     placeholder = CUDA.zeros(T, 1)
@@ -175,7 +196,7 @@ function _launch_cuda_bm_regular_transform!(
             cache.faces,
             cache.curls,
             cache.test_indices,
-            cache.trial_indices,
+            trial_indices,
             cache.rule_points,
             cache.rule_weights,
             k,
@@ -262,8 +283,14 @@ function add_cuda_bm_singular_corrections!(
     regular_cache;
     timing=nothing,
     rhs_only::Bool=false,
+    block_cache=nothing,
 ) where {T<:AbstractFloat}
     host_cache.pair_count == 0 && return 0
+    cache_key = (objectid(cuda_cache), k)
+    if block_cache !== nothing && haskey(block_cache, cache_key)
+        return _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
+            block_cache[cache_key], cuda_cache, k; rhs_only=rhs_only)
+    end
     blocks = _cuda_bm_block_arrays(T, host_cache.pair_count)
     try
         _cuda_timed_stage!(timing, "direct_system_singular_compute") do
@@ -292,11 +319,12 @@ function add_cuda_bm_singular_corrections!(
             )
             CUDA.synchronize()
         end
+        block_cache === nothing || (block_cache[cache_key] = blocks)
         return _cuda_timed_stage!(timing, "direct_system_singular_scatter") do
             _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, blocks, cuda_cache, k; rhs_only=rhs_only)
         end
     finally
-        _release_cuda_bm_block_arrays!(blocks)
+        (block_cache === nothing || !haskey(block_cache, cache_key)) && _release_cuda_bm_block_arrays!(blocks)
     end
 end
 
@@ -314,9 +342,15 @@ function add_cuda_bm_image_corrections!(
     timing=nothing,
     timing_prefix="direct_system_image",
     rhs_only::Bool=false,
+    block_cache=nothing,
 ) where {T<:AbstractFloat}
     cuda_cache === nothing && return 0
     cuda_cache.pair_count == 0 && return 0
+    cache_key = (objectid(cuda_cache), k)
+    if block_cache !== nothing && haskey(block_cache, cache_key)
+        return _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
+            block_cache[cache_key], cuda_cache, k; rhs_only=rhs_only)
+    end
     blocks = _cuda_bm_block_arrays(T, cuda_cache.pair_count)
     try
         _cuda_timed_stage!(timing, "$(timing_prefix)_compute") do
@@ -350,11 +384,12 @@ function add_cuda_bm_image_corrections!(
             )
             CUDA.synchronize()
         end
+        block_cache === nothing || (block_cache[cache_key] = blocks)
         return _cuda_timed_stage!(timing, "$(timing_prefix)_scatter") do
             _scatter_cuda_bm_blocks!(matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, blocks, cuda_cache, k; rhs_only=rhs_only)
         end
     finally
-        _release_cuda_bm_block_arrays!(blocks)
+        (block_cache === nothing || !haskey(block_cache, cache_key)) && _release_cuda_bm_block_arrays!(blocks)
     end
 end
 
@@ -375,6 +410,7 @@ function assemble_burton_miller_neumann_system_cuda(
     device_image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
     timing=nothing,
+    block_cache=nothing,
     identity_p1_p1_block=nothing,
     assemble_operator::Bool=false,
 ) where {T<:AbstractFloat}
@@ -448,19 +484,19 @@ function assemble_burton_miller_neumann_system_cuda(
         singular_pairs = add_cuda_bm_singular_corrections!(
             matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
             mesh, k, singular_cache, device_singular_cache, device_cache;
-            timing=timing,
+            timing=timing, block_cache=block_cache,
         )
         image_singular_pairs = add_cuda_bm_image_corrections!(
             matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
             mesh, k, rule, device_image_singular_cache, device_cache;
-            timing=timing,
+            timing=timing, block_cache=block_cache,
         )
         near_pair_count = 0
         if near_correction_cache !== nothing && near_correction_cache.pair_count > 0
             near_pair_count += add_cuda_bm_image_corrections!(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
                 mesh, k, rule, device_near_correction_cache, device_cache;
-                timing=timing,
+                timing=timing, block_cache=block_cache,
                 timing_prefix="direct_system_near",
             )
         end
@@ -468,7 +504,7 @@ function assemble_burton_miller_neumann_system_cuda(
             near_pair_count += add_cuda_bm_image_corrections!(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
                 mesh, k, rule, device_image_near_correction_cache, device_cache;
-                timing=timing,
+                timing=timing, block_cache=block_cache,
                 timing_prefix="direct_system_ground_near",
             )
         end
@@ -560,7 +596,10 @@ function assemble_burton_miller_rhs_cuda(
     device_image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
     timing=nothing,
+    block_cache=nothing,
     assemble_operator::Bool=false,
+    operator_columns=nothing,
+    regular_system=nothing,
 ) where {T<:AbstractFloat}
     k = outgoing_wavenumber(k)
     CUDA.functional() || error("Burton-Miller CUDA RHS assembly requested, but CUDA.functional() is false.")
@@ -581,60 +620,80 @@ function assemble_burton_miller_rhs_cuda(
     end
 
     p1_count = p1_space.global_dof_count
-    matrix_re = CUDA.zeros(T, 1)
-    matrix_im = CUDA.zeros(T, 1)
+    operator_columns === nothing || assemble_operator || error("operator_columns requires assemble_operator")
+    columns = operator_columns === nothing ? nothing : Int.(operator_columns)
+    if columns !== nothing
+        !isempty(columns) && length(unique(columns)) == length(columns) &&
+            all(i -> 1 <= i <= dp0_space.global_dof_count, columns) || error("Invalid RHS column subset")
+    end
+    column_count = columns === nothing ? dp0_space.global_dof_count : length(columns)
+    matrix_lanes = regular_system === nothing ? nothing : reinterpret(reshape, T, regular_system)
+    matrix_re = regular_system === nothing ? CUDA.zeros(T, 1) : view(matrix_lanes, 1, :, :)
+    matrix_im = regular_system === nothing ? CUDA.zeros(T, 1) : view(matrix_lanes, 2, :, :)
+    column_map = device_columns = nothing
     storage = rhs_re = rhs_im = rhs = nothing
     succeeded = false
     try
         # Interleaved storage exposes the matrix without a second full copy.
         # With unit q, each column is the existing DP0-to-P1 RHS mapping.
-        storage = assemble_operator ? CUDA.zeros(T, 2, p1_count, dp0_space.global_dof_count) : nothing
+        storage = assemble_operator ? CUDA.zeros(T, 2, p1_count, column_count) : nothing
         rhs_re = assemble_operator ? view(storage, 1, :, :) : CUDA.zeros(T, p1_count)
         rhs_im = assemble_operator ? view(storage, 2, :, :) : CUDA.zeros(T, p1_count)
+        scatter_re, scatter_im = rhs_re, rhs_im
+        if columns !== nothing
+            mapping = zeros(Int32, dp0_space.global_dof_count)
+            mapping[columns] = Int32.(1:column_count)
+            column_map = CuArray(mapping)
+            device_columns = CuArray(Int32.(columns))
+            scatter_re = CudaRhsColumnTile(CUDA.cudaconvert(rhs_re), CUDA.cudaconvert(column_map), p1_count)
+            scatter_im = CudaRhsColumnTile(CUDA.cudaconvert(rhs_im), CUDA.cudaconvert(column_map), p1_count)
+        end
         identity_transform = symmetry_transforms(:off; include_identity=true)[1]
         _cuda_timed_stage!(timing, "rhs_regular") do
             _launch_cuda_bm_regular_transform!(
-                matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, device_cache, k, identity_transform;
+                matrix_re, matrix_im, scatter_re, scatter_im, q_neumann, device_cache, k, identity_transform;
                 skip_adjacent=true,
-                rhs_only=true,
+                trial_indices=columns === nothing ? device_cache.trial_indices : device_columns,
+                rhs_only=regular_system === nothing,
             )
         end
         for transform in symmetry_image_transforms(symmetry_mode)
             _cuda_timed_stage!(timing, "rhs_regular_image") do
                 _launch_cuda_bm_regular_transform!(
-                    matrix_re, matrix_im, rhs_re, rhs_im, q_neumann, device_cache, k, transform;
+                    matrix_re, matrix_im, scatter_re, scatter_im, q_neumann, device_cache, k, transform;
                     skip_adjacent=false,
-                    rhs_only=true,
+                    trial_indices=columns === nothing ? device_cache.trial_indices : device_columns,
+                    rhs_only=regular_system === nothing,
                 )
             end
         end
 
         add_cuda_bm_singular_corrections!(
-            matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
+            matrix_re, matrix_im, scatter_re, scatter_im, q_neumann,
             mesh, k, singular_cache, device_singular_cache, device_cache;
-            timing=timing,
+            timing=timing, block_cache=block_cache,
             rhs_only=true,
         )
         add_cuda_bm_image_corrections!(
-            matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
+            matrix_re, matrix_im, scatter_re, scatter_im, q_neumann,
             mesh, k, rule, device_image_singular_cache, device_cache;
-            timing=timing,
+            timing=timing, block_cache=block_cache,
             rhs_only=true,
         )
         if near_correction_cache !== nothing && near_correction_cache.pair_count > 0
             add_cuda_bm_image_corrections!(
-                matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
+                matrix_re, matrix_im, scatter_re, scatter_im, q_neumann,
                 mesh, k, rule, device_near_correction_cache, device_cache;
-                timing=timing,
+                timing=timing, block_cache=block_cache,
                 timing_prefix="rhs_near",
                 rhs_only=true,
             )
         end
         if image_near_correction_cache !== nothing && image_near_correction_cache.pair_count > 0
             add_cuda_bm_image_corrections!(
-                matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
+                matrix_re, matrix_im, scatter_re, scatter_im, q_neumann,
                 mesh, k, rule, device_image_near_correction_cache, device_cache;
-                timing=timing,
+                timing=timing, block_cache=block_cache,
                 timing_prefix="rhs_ground_near",
                 rhs_only=true,
             )
@@ -646,8 +705,8 @@ function assemble_burton_miller_rhs_cuda(
             CUDA.@cuda threads=threads blocks=blocks _cuda_bm_identity_kernel!(
                 matrix_re,
                 matrix_im,
-                rhs_re,
-                rhs_im,
+                scatter_re,
+                scatter_im,
                 device_cache.areas,
                 device_cache.faces,
                 q_neumann,
@@ -674,16 +733,34 @@ function assemble_burton_miller_rhs_cuda(
         end
 
         _cuda_timed_stage!(timing, "rhs_complex_materialize") do
-            rhs = assemble_operator ? reshape(reinterpret(Complex{T}, storage), p1_count, dp0_space.global_dof_count) : complex.(rhs_re, rhs_im)
+            if assemble_operator
+                # Both reinterpret and reshape create owning CuArray aliases.
+                # Release intermediates explicitly: otherwise each cabinet slab
+                # remains live until GC and can force WDDM device-memory paging.
+                complex_storage = reinterpret(Complex{T}, storage)
+                try
+                    rhs = reshape(complex_storage, p1_count, column_count)
+                finally
+                    CUDA.unsafe_free!(complex_storage)
+                end
+            else
+                rhs = complex.(rhs_re, rhs_im)
+            end
             CUDA.synchronize()
         end
         succeeded = true
         return rhs
     finally
-        CUDA.unsafe_free!(matrix_re)
-        CUDA.unsafe_free!(matrix_im)
+        column_map === nothing || CUDA.unsafe_free!(column_map)
+        device_columns === nothing || CUDA.unsafe_free!(device_columns)
+        if matrix_lanes === nothing
+            CUDA.unsafe_free!(matrix_re)
+            CUDA.unsafe_free!(matrix_im)
+        else
+            CUDA.unsafe_free!(matrix_lanes)
+        end
         if assemble_operator
-            (!succeeded && storage !== nothing) && CUDA.unsafe_free!(storage)
+            storage === nothing || CUDA.unsafe_free!(storage)
         else
             rhs_re === nothing || CUDA.unsafe_free!(rhs_re)
             rhs_im === nothing || CUDA.unsafe_free!(rhs_im)

@@ -8,7 +8,7 @@ using .BeatEngineCoupled
 using LinearAlgebra, Printf, SparseArrays, StaticArrays
 
 const FIXTURE_ROOT = normpath(
-    joinpath(@__DIR__, "..", "..", "..", "..", "..", "tests", "fixtures"),
+    joinpath(@__DIR__, "..", "tests", "fixtures"),
 )
 
 function relative_error(reference, candidate)

@@ -79,10 +79,17 @@ using .CompiledDriver.BeatEngineCore
             @test CompiledDriver.exterior_quadrature_selection(
                 options, mesh, frequency, sound_speed, base_order, backend,
             ).mode == "fixed"
-            @test_throws ErrorException SourceDriver.regular_quadrature_mode_from_config(wavelength_options, backend)
-            @test_throws ErrorException CompiledDriver.exterior_quadrature_selection(
-                wavelength_options, mesh, frequency, sound_speed, base_order, backend,
-            )
+            if backend == :rocm
+                @test SourceDriver.regular_quadrature_mode_from_config(wavelength_options, backend) == "wavelength"
+                @test CompiledDriver.exterior_quadrature_selection(
+                    wavelength_options, mesh, frequency, sound_speed, base_order, backend,
+                ) == wavelength
+            else
+                @test_throws ErrorException SourceDriver.regular_quadrature_mode_from_config(wavelength_options, backend)
+                @test_throws ErrorException CompiledDriver.exterior_quadrature_selection(
+                    wavelength_options, mesh, frequency, sound_speed, base_order, backend,
+                )
+            end
         end
     end
 end

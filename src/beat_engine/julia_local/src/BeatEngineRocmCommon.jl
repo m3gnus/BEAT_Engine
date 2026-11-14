@@ -12,6 +12,35 @@ struct RocmSingularCorrectionCache{T}
     pair_count::Int
 end
 
+"""Own the quadrature-dependent ROCm buffers for one regular rule."""
+function build_rocm_quadrature_cache(mesh::BoundaryMesh{T}, p1, dp0, rule;
+    singular_order, symmetry_mode, assembly_mode=nothing) where {T}
+    identity = (
+        assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :p1; symmetry_mode),
+        assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0; symmetry_mode),
+    )
+    device_cache = field_cache = device_identity_cache = nothing
+    try
+        device_cache = build_rocm_regular_assembly_cache(mesh, p1, dp0, rule;
+            singular_order, symmetry_mode, assembly_mode)
+        field_cache = build_rocm_field_evaluation_cache(build_field_evaluation_cache(mesh, rule; symmetry_mode))
+        device_identity_cache = build_rocm_burton_miller_identity_cache(identity[1], identity[2], T)
+        return (; rule, identity, device_cache, field_cache, device_identity_cache)
+    catch
+        device_identity_cache === nothing || release_rocm_burton_miller_identity_cache!(device_identity_cache)
+        field_cache === nothing || release_rocm_field_evaluation_cache!(field_cache)
+        device_cache === nothing || release_rocm_regular_assembly_cache!(device_cache)
+        rethrow()
+    end
+end
+
+function release_rocm_quadrature_cache!(cache)
+    release_rocm_burton_miller_identity_cache!(cache.device_identity_cache)
+    release_rocm_field_evaluation_cache!(cache.field_cache)
+    release_rocm_regular_assembly_cache!(cache.device_cache)
+    return nothing
+end
+
 struct RocmRegularAssemblyCache{T,C}
     host_cache::C
     face_vertices

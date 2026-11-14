@@ -1,5 +1,9 @@
 include(joinpath(@__DIR__, "deploy_cpu.jl"))
+include(joinpath(@__DIR__, "deploy_rocm.jl"))
 include(joinpath(@__DIR__, "deploy_rhs_policy.jl"))
+include(joinpath(@__DIR__, "deploy_rhs_compression.jl"))
+include(joinpath(@__DIR__, "deploy_rhs_projection.jl"))
+include(joinpath(@__DIR__, "deploy_factor_cache.jl"))
 const DEPLOY_RHS_CALIBRATION = Ref{Any}(nothing)
 
 const DEPLOY_BOUNDARY_STATE = Ref{Any}(nothing)
@@ -14,12 +18,17 @@ function release_deploy_boundary_state!()
         cuda = BeatEngineCore.CUDA_MODULE
         state.pressure isa cuda.CuArray && cuda.unsafe_free!(state.pressure)
         state.q_neumann isa cuda.CuArray && cuda.unsafe_free!(state.q_neumann)
+    elseif state.backend == :rocm
+        Bool(get(state, :shared_geometry, false)) || release_rocm_field_evaluation_cache!(state.field_cache)
+    elseif state.backend == :metal
+        Bool(get(state, :shared_geometry, false)) || release_metal_field_evaluation_cache!(state.field_cache)
     end
     DEPLOY_BOUNDARY_STATE[] = nothing
     return nothing
 end
 
 function release_deploy_geometry_state!()
+    release_deploy_factor_state!()
     state = DEPLOY_GEOMETRY_STATE[]
     state === nothing && return nothing
     release_deploy_boundary_state!()
@@ -40,6 +49,14 @@ function release_deploy_geometry_state!()
                 value isa cuda.CuArray && cuda.unsafe_free!(value)
             end
         end
+    elseif state.backend == :rocm
+        release_rocm_field_evaluation_cache!(state.field_cache)
+        release_rocm_regular_assembly_cache!(state.device_cache)
+        state.device_singular_cache === nothing || release_rocm_singular_correction_cache!(state.device_singular_cache)
+    elseif state.backend == :metal
+        release_metal_field_evaluation_cache!(state.field_cache)
+        release_metal_regular_assembly_cache!(state.device_cache)
+        state.device_singular_cache === nothing || release_metal_singular_correction_cache!(state.device_singular_cache)
     end
     DEPLOY_GEOMETRY_STATE[] = nothing
     return nothing
@@ -555,7 +572,7 @@ function solve_deploy_request_impl(
     schema_version = Int(get_value(request, "schema_version", 1))
     schema_version in (1, 2, 3) || error("Unsupported Deploy solve schema_version $(schema_version).")
     beat_backend = beat_backend_from_request(request)
-    beat_backend in (:cuda, :cpu) || error("Deploy Level 2 currently supports BEAT CUDA or CPU.")
+    beat_backend in (:cuda, :cpu, :metal, :rocm) || error("Deploy supports BEAT CUDA, CPU, Metal or ROCm.")
     requested_assembly_mode = lowercase(String(get_value(request, "burton_miller_assembly", "direct_system")))
     requested_assembly_mode in ("direct_system", "operator_matrices") || error(
         "Deploy burton_miller_assembly must be 'direct_system' or 'operator_matrices'.",
@@ -763,6 +780,10 @@ function solve_deploy_request_impl(
     cached_q_neumann = nothing
     weighted_sources = nothing
     rom_factorization = nothing
+    rocm_system = nothing
+    compressed_rhs = nothing
+    projected_rhs = nothing
+    compression_report = nothing
     rom_iterations = 0
     rom_operator_applications = 0
     rom_residual = FloatType(NaN)
@@ -781,7 +802,24 @@ function solve_deploy_request_impl(
     rom_rhs_calibration_seconds = 0.0
     rom_rhs_operator_used = false
     rom_rhs_mode = String(get_value(request, "rom_feedback_mode", get(ENV, "BEAT_DEPLOY_ROM_FEEDBACK", "auto")))
-    rom_rhs_mode in ("auto", "matrix_free", "cached_operator") || error("Unknown Deploy ROM feedback mode.")
+    rom_rhs_mode in ("auto", "matrix_free", "cached_operator", "compressed", "projected", "projected_cached", "projected_fused", "projected_reuse") || error("Unknown Deploy ROM feedback mode.")
+    rom_rhs_mode in ("compressed", "projected", "projected_cached", "projected_fused", "projected_reuse") && !(rom_request && beat_backend == :cuda) &&
+        error("Experimental RHS compression requires a Deploy CUDA ROM request")
+    retain_factors = rom_rhs_mode == "projected_reuse"
+    retain_factors && retain_geometry_cache && error("Experimental factor reuse requires fresh geometry validation")
+    factor_key = ""
+    factor_key_seconds = 0.0
+    if retain_factors
+        factor_key_seconds = @elapsed factor_key = deploy_factor_signature(request, mesh, speaker_rom)
+    end
+    factor_state = DEPLOY_FACTOR_STATE[]
+    if !retain_factors || (factor_state !== nothing && factor_state.key != factor_key)
+        release_deploy_factor_state!()
+        factor_state = nothing
+    end
+    factor_hit = retain_factors && factor_state !== nothing
+    factors_retained = false
+    correction_blocks = rom_rhs_mode in ("projected_cached", "projected_fused", "projected_reuse") ? Dict{Any,Any}() : nothing
     rom_feedback_rhs_stage_seconds = Dict{String,Float64}()
     rom_feedback_preconditioner_seconds = 0.0
     rom_feedback_update_seconds = 0.0
@@ -832,6 +870,24 @@ function solve_deploy_request_impl(
                     field_cache = build_cuda_field_evaluation_cache(cpu_field_cache)
                 end
                 cached_q_neumann = BeatEngineCore.CUDA_MODULE.CuArray(q_neumann)
+            elseif beat_backend == :rocm
+                if cached_geometry === nothing
+                    emit_event("status"; message="Preparing BEAT ROCm geometry caches")
+                    device_cache = build_rocm_regular_assembly_cache(mesh, p1_space, dp0_space, rule;
+                        singular_order=singular_order, symmetry_mode=:ground)
+                    device_singular_cache = build_rocm_singular_correction_cache(singular_cache)
+                    field_cache = build_rocm_field_evaluation_cache(cpu_field_cache)
+                end
+            elseif beat_backend == :metal
+                if cached_geometry === nothing
+                    emit_event("status"; message="Preparing BEAT Metal geometry caches")
+                    device_cache = build_metal_regular_assembly_cache(mesh, p1_space, dp0_space, rule;
+                        singular_order=singular_order, symmetry_mode=:ground)
+                    if BeatEngineCore._normalized_metal_assembly_mode(nothing) == :native
+                        device_singular_cache = build_metal_singular_correction_cache(singular_cache)
+                    end
+                    field_cache = build_metal_field_evaluation_cache(cpu_field_cache)
+                end
             else
                 cached_geometry === nothing && emit_event("status"; message="Preparing BEAT CPU geometry caches")
             end
@@ -868,7 +924,35 @@ function solve_deploy_request_impl(
             "Assembling Level 2 rigid half-space boundary operators"
         emit_event("status"; message=assembly_message)
         assembly_seconds = @elapsed begin
-            if direct_cuda_assembly
+            if factor_hit
+                rhs = assemble_burton_miller_rhs_cuda(mesh, p1_space, dp0_space, cached_q_neumann, k, rule;
+                    device_cache=device_cache, singular_cache=singular_cache,
+                    device_singular_cache=device_singular_cache,
+                    device_image_singular_cache=device_image_singular_cache,
+                    near_correction_cache=near_correction_cache,
+                    device_near_correction_cache=device_near_correction_cache,
+                    image_near_correction_cache=ground_near_correction_cache,
+                    device_image_near_correction_cache=device_ground_near_correction_cache,
+                    symmetry_mode=:ground)
+                direct_system = merge(factor_state.diagnostics, (matrix=factor_state.factorization.factors, rhs=rhs))
+                direct_system_consumed = true
+                projected_rhs = (operator=factor_state.operator, groups=deploy_projection_groups(speaker_rom),
+                    drive_rhs=nothing, report=copy(factor_state.report))
+                projected_rhs.report["column_assembly_s"] = 0.0
+                projected_rhs.report["projection_s"] = 0.0
+                projected_rhs.report["matrix_finalize_s"] = 0.0
+            elseif rom_rhs_mode in ("projected_fused", "projected_reuse")
+                direct_system, projected_rhs = build_deploy_fused_system(mesh, p1_space, dp0_space,
+                    q_neumann, k, rule, speaker_rom;
+                    device_cache=device_cache, singular_cache=singular_cache,
+                    device_singular_cache=device_singular_cache,
+                    device_image_singular_cache=device_image_singular_cache,
+                    near_correction_cache=near_correction_cache,
+                    device_near_correction_cache=device_near_correction_cache,
+                    image_near_correction_cache=ground_near_correction_cache,
+                    device_image_near_correction_cache=device_ground_near_correction_cache,
+                    block_cache=correction_blocks, progress=message -> emit_event("status"; message=message))
+            elseif direct_cuda_assembly
                 direct_system = assemble_burton_miller_neumann_system_cuda(
                     mesh,
                     p1_space,
@@ -886,6 +970,7 @@ function solve_deploy_request_impl(
                     device_image_near_correction_cache=device_ground_near_correction_cache,
                     symmetry_mode=:ground,
                     timing=direct_assembly_timings,
+                    block_cache=correction_blocks,
                 )
             else
                 operators = assemble_regular_galerkin_operators(
@@ -898,8 +983,8 @@ function solve_deploy_request_impl(
                     singular_order=singular_order,
                     backend=beat_backend,
                     device_cache=device_cache,
-                    return_device=beat_backend == :cuda,
-                    accelerator_quadrature=beat_backend == :cuda,
+                    return_device=beat_backend in (:cuda, :metal, :rocm),
+                    accelerator_quadrature=beat_backend in (:cuda, :metal, :rocm),
                     singular_cache=singular_cache,
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
@@ -909,6 +994,9 @@ function solve_deploy_request_impl(
                     device_image_near_correction_cache=device_ground_near_correction_cache,
                     symmetry_mode=:ground,
                 )
+                if beat_backend == :metal
+                    operators = metal_host_operators(operators)
+                end
             end
         end
 
@@ -919,22 +1007,25 @@ function solve_deploy_request_impl(
                 "Solving fixed-Neumann exterior system",
         )
         solve_seconds = @elapsed begin
-            pressure = if rom_request && beat_backend == :cpu
+            pressure = if rom_request && beat_backend in (:cpu, :metal, :rocm)
                 cpu_system = nothing
+                build_system = beat_backend == :rocm ? build_deploy_rocm_system : BeatEngineCore.build_burton_miller_neumann_cpu_system
+                solve_system = beat_backend == :rocm ? solve_deploy_rocm_system : BeatEngineCore.solve_burton_miller_neumann_cpu_system
                 rom_factorization_seconds = @elapsed begin
-                    cpu_system = BeatEngineCore.build_burton_miller_neumann_cpu_system(
+                    cpu_system = build_system(
                         operators, identity_p1_p1, identity_p1_dp0, k,
                     )
+                    beat_backend == :rocm && (rocm_system = cpu_system)
                 end
                 preconditioned_rhs = nothing
                 rom_initial_preconditioner_seconds = @elapsed begin
-                    preconditioned_rhs = BeatEngineCore.solve_burton_miller_neumann_cpu_system(
+                    preconditioned_rhs = solve_system(
                         cpu_system, q_neumann, FloatType,
                     )
                 end
                 apply_schur = function(candidate)
                     feedback = deploy_speaker_rom_response(speaker_rom, candidate; include_drive=false)
-                    response = BeatEngineCore.solve_burton_miller_neumann_cpu_system(
+                    response = solve_system(
                         cpu_system, feedback.q, FloatType,
                     )
                     return candidate - response
@@ -958,7 +1049,7 @@ function solve_deploy_request_impl(
             elseif rom_request
                 cuda = BeatEngineCore.CUDA_MODULE
                 rom_factorization_seconds = @elapsed begin
-                    rom_factorization = lu!(direct_system.matrix)
+                    rom_factorization = factor_hit ? factor_state.factorization : lu!(direct_system.matrix)
                     cuda.synchronize()
                 end
                 direct_system_consumed = true
@@ -1013,6 +1104,48 @@ function solve_deploy_request_impl(
                             operator_units === nothing || cuda.unsafe_free!(operator_units)
                         end
                     end
+                    if projected_rhs === nothing && rom_rhs_mode in ("compressed", "projected", "projected_cached", "projected_fused", "projected_reuse")
+                        options = get_value(request, "experimental_rhs_compression", Dict{String,Any}())
+                        units = cuda.ones(Complex{FloatType}, length(cached_q_neumann))
+                        try
+                            assemble_columns = columns -> assemble_burton_miller_rhs_cuda(
+                                mesh, p1_space, dp0_space, units, k, rule;
+                                device_cache=device_cache, singular_cache=singular_cache,
+                                device_singular_cache=device_singular_cache,
+                                device_image_singular_cache=device_image_singular_cache,
+                                near_correction_cache=near_correction_cache,
+                                device_near_correction_cache=device_near_correction_cache,
+                                image_near_correction_cache=ground_near_correction_cache,
+                                device_image_near_correction_cache=device_ground_near_correction_cache,
+                                symmetry_mode=:ground, assemble_operator=true, operator_columns=columns,
+                                block_cache=correction_blocks)
+                            rom_rhs_operator_build_seconds += @elapsed begin
+                                if rom_rhs_mode in ("projected", "projected_cached", "projected_fused", "projected_reuse")
+                                    projected_rhs = build_deploy_projected_rhs(speaker_rom, assemble_columns;
+                                        progress=message -> emit_event("status"; message=message))
+                                else
+                                    compressed_rhs = build_deploy_compressed_rhs(mesh, assemble_columns, options;
+                                        progress=message -> emit_event("status"; message=message))
+                                end
+                            end
+                            compression_report = projected_rhs !== nothing ? projected_rhs.report : Dict(k=>v for (k,v) in compressed_rhs.report if k != "blocks")
+                            if compressed_rhs !== nothing && Bool(get(options, "survey_only", false))
+                                release_deploy_compressed_rhs!(compressed_rhs)
+                                compressed_rhs = nothing
+                            end
+                        finally
+                            cuda.unsafe_free!(units)
+                        end
+                    end
+                    if projected_rhs !== nothing
+                        compression_report = projected_rhs.report
+                        compression_report["factor_cache_hit"] = factor_hit
+                        compression_report["factor_signature"] = factor_key
+                        compression_report["retained_factor_bytes"] = retain_factors ?
+                            sizeof(eltype(rom_factorization.factors))*length(rom_factorization.factors) +
+                            sizeof(eltype(rom_factorization.ipiv))*length(rom_factorization.ipiv) +
+                            compression_report["stored_bytes"] : 0
+                    end
                     apply_schur = function(candidate_pressure)
                         candidate_host = nothing
                         rom_feedback_pressure_download_seconds += @elapsed begin
@@ -1020,11 +1153,9 @@ function solve_deploy_request_impl(
                         end
                         feedback = nothing
                         rom_feedback_model_seconds += @elapsed begin
-                            feedback = deploy_speaker_rom_response(
-                                speaker_rom,
-                                candidate_host;
-                                include_drive=false,
-                            )
+                            feedback = projected_rhs !== nothing ?
+                                (q=deploy_projection_coordinates(projected_rhs.groups, candidate_host),) :
+                                deploy_speaker_rom_response(speaker_rom, candidate_host; include_drive=false)
                         end
                         feedback_device = nothing
                         rom_feedback_upload_seconds += @elapsed begin
@@ -1038,7 +1169,16 @@ function solve_deploy_request_impl(
                                 if use_operator && rom_rhs_operator === nothing
                                     build_feedback_operator(rhs_stage_timings)
                                 end
-                                if rom_rhs_operator === nothing
+                                if projected_rhs !== nothing
+                                    rom_rhs_operator_apply_seconds += @elapsed begin
+                                        feedback_rhs = projected_rhs.operator * feedback_device
+                                        cuda.synchronize()
+                                    end
+                                elseif compressed_rhs !== nothing
+                                    rom_rhs_operator_apply_seconds += @elapsed begin
+                                        feedback_rhs = apply_deploy_compressed_rhs(compressed_rhs, feedback_device)
+                                    end
+                                elseif rom_rhs_operator === nothing
                                     feedback_rhs = assemble_burton_miller_rhs_cuda(
                                         mesh,
                                         p1_space,
@@ -1112,6 +1252,38 @@ function solve_deploy_request_impl(
                         rom_operator_applications,
                         rom_initial_relative_residual,
                     ) = gmres_result
+                    if compressed_rhs !== nothing || projected_rhs !== nothing
+                        # Audit the converged pressure using exact quadrature and the
+                        # retained exact exterior LU, independently of compression.
+                        audit_s = @elapsed begin
+                            audit_q = audit_rhs = audit_solution = nothing
+                            try
+                                response = deploy_speaker_rom_response(speaker_rom, Array(rom_pressure); include_drive=false)
+                                audit_q = cuda.CuArray(response.q)
+                                audit_rhs = assemble_burton_miller_rhs_cuda(
+                                    mesh, p1_space, dp0_space, audit_q, k, rule;
+                                    device_cache=device_cache, singular_cache=singular_cache,
+                                    device_singular_cache=device_singular_cache,
+                                    device_image_singular_cache=device_image_singular_cache,
+                                    near_correction_cache=near_correction_cache,
+                                    device_near_correction_cache=device_near_correction_cache,
+                                    image_near_correction_cache=ground_near_correction_cache,
+                                    device_image_near_correction_cache=device_ground_near_correction_cache,
+                                    symmetry_mode=:ground)
+                                audit_solution = rom_factorization \ audit_rhs
+                                audit_solution .= rom_pressure .- audit_solution .- preconditioned_rhs
+                                actual_residual = norm(audit_solution) / max(norm(preconditioned_rhs), eps(FloatType))
+                                compression_report["exact_preconditioned_relative_residual"] = actual_residual
+                                isfinite(actual_residual) && actual_residual <= 1e-3 ||
+                                    error("Experimental compressed RHS failed exact-operator residual gate: $actual_residual")
+                            finally
+                                audit_q === nothing || cuda.unsafe_free!(audit_q)
+                                audit_rhs === nothing || cuda.unsafe_free!(audit_rhs)
+                                audit_solution === nothing || cuda.unsafe_free!(audit_solution)
+                            end
+                        end
+                        compression_report["audit_s"] = audit_s
+                    end
                     # Calibrate once on a successful matrix-free solve, using its actual
                     # iteration count. The first solve pays this probe; later solves/sweep
                     # frequencies choose from measured build/apply costs, not GPU constants.
@@ -1153,11 +1325,23 @@ function solve_deploy_request_impl(
                         cached_q_neumann = cuda.CuArray(final_rom_response.q)
                         cuda.synchronize()
                     end
+                    if retain_factors
+                        diagnostics = (; (name=>getproperty(direct_system,name) for name in keys(direct_system)
+                            if name != :matrix && name != :rhs)...)
+                        DEPLOY_FACTOR_STATE[] = (key=factor_key, factorization=rom_factorization,
+                            operator=projected_rhs.operator, report=copy(compression_report), diagnostics=diagnostics)
+                        factors_retained = true
+                    end
                     rom_pressure
                 finally
+                    compressed_rhs === nothing || release_deploy_compressed_rhs!(compressed_rhs)
                     rom_rhs_operator === nothing || cuda.unsafe_free!(rom_rhs_operator)
                     cuda.unsafe_free!(preconditioned_rhs)
                 end
+            elseif beat_backend == :rocm
+                rocm_system = build_deploy_rocm_system(operators, identity_p1_p1, identity_p1_dp0, k)
+                cached_q_neumann = copy(q_neumann)
+                solve_deploy_rocm_system(rocm_system, cached_q_neumann, FloatType)
             elseif direct_cuda_assembly
                 direct_system_consumed = true
                 solve_burton_miller_system_cuda!(direct_system; return_gpu=true)
@@ -1291,10 +1475,22 @@ function solve_deploy_request_impl(
                     "fidelity" => rom_request ? "level3_parity_petrov_galerkin" : "level2",
                 ),
             )
+            if beat_backend == :rocm
+                result["diagnostics"]["linear_solver"] = "rocm_rocsolver_dense_lu"
+                result["diagnostics"]["dense_factorization_precision"] = "float64"
+                result["diagnostics"]["near_correction_backend"] = "rocm"
+                result["diagnostics"]["field_backend"] = "rocm"
+                rom_request && (result["diagnostics"]["rom_krylov_backend"] = "cpu")
+            elseif beat_backend == :metal
+                result["diagnostics"]["linear_solver"] = "metal_assembly_cpu_dense_lu"
+                result["diagnostics"]["near_correction_backend"] = "cpu"
+                result["diagnostics"]["field_backend"] = "metal"
+            end
             if rom_request
-                result["diagnostics"]["rom_feedback_mode"] = rom_rhs_operator_used ? "cached_operator" : "matrix_free"
+                result["diagnostics"]["rom_feedback_mode"] = projected_rhs !== nothing ? "projected" : compressed_rhs !== nothing ? "compressed" : rom_rhs_operator_used ? "cached_operator" : "matrix_free"
+                result["diagnostics"]["rhs_compression"] = compression_report
                 result["diagnostics"]["rom_feedback_requested_mode"] = rom_rhs_mode
-                result["diagnostics"]["rom_rhs_operator_bytes"] = rom_rhs_operator_used ? sizeof(Complex{FloatType}) * length(mesh.vertices) * length(mesh.faces) : 0
+                result["diagnostics"]["rom_rhs_operator_bytes"] = (compressed_rhs !== nothing || projected_rhs !== nothing) ? compression_report["stored_bytes"] : rom_rhs_operator_used ? sizeof(Complex{FloatType}) * length(mesh.vertices) * length(mesh.faces) : 0
                 result["diagnostics"]["rom_rank_per_sector"] = speaker_rom.rank
                 result["diagnostics"]["rom_sector_count"] = speaker_rom.sector_count
                 result["diagnostics"]["rom_symmetry"] = String(speaker_rom.symmetry)
@@ -1363,6 +1559,7 @@ function solve_deploy_request_impl(
             rom_solve_other_seconds = max(0.0, solve_seconds - rom_profiled_solve_seconds)
             rom_timings = Dict(
                 "rom_factorization_s" => rom_factorization_seconds,
+                "rom_factor_key_s" => factor_key_seconds,
                 "rom_initial_preconditioner_s" => rom_initial_preconditioner_seconds,
                 "rom_gmres_s" => rom_gmres_seconds,
                 "rom_feedback_pressure_download_s" => rom_feedback_pressure_download_seconds,
@@ -1390,20 +1587,48 @@ function solve_deploy_request_impl(
         end
         emit_event("result"; result=result)
     finally
+        if projected_rhs !== nothing && !factors_retained && !factor_hit
+            BeatEngineCore.CUDA_MODULE.unsafe_free!(projected_rhs.operator)
+        end
+        if correction_blocks !== nothing
+            for blocks in values(correction_blocks)
+                BeatEngineCore._release_cuda_bm_block_arrays!(blocks)
+            end
+        end
         cuda_observation === nothing || release_cuda_observation_points!(cuda_observation)
+        release_deploy_rocm_system!(rocm_system)
         operators === nothing || release_operator_storage!(operators)
         (direct_system === nothing || direct_system_consumed) ||
             release_burton_miller_system_cuda!(direct_system)
         if rom_factorization !== nothing
             cuda = BeatEngineCore.CUDA_MODULE
-            cuda.unsafe_free!(rom_factorization.factors)
-            cuda.unsafe_free!(rom_factorization.ipiv)
+            if !factors_retained && !factor_hit
+                cuda.unsafe_free!(rom_factorization.factors)
+                cuda.unsafe_free!(rom_factorization.ipiv)
+            end
             cuda.unsafe_free!(direct_system.rhs)
         end
         retained_state = DEPLOY_GEOMETRY_STATE[]
         geometry_resources_retained = retain_geometry_cache && retained_state !== nothing &&
             retained_state.field_cache === field_cache
         if !geometry_resources_retained
+            if beat_backend == :rocm
+                device_cache === nothing || release_rocm_regular_assembly_cache!(device_cache)
+                device_singular_cache === nothing || release_rocm_singular_correction_cache!(device_singular_cache)
+                boundary_state = DEPLOY_BOUNDARY_STATE[]
+                field_retained = boundary_state !== nothing && boundary_state.field_cache === field_cache
+                if !field_retained && field_cache !== cpu_field_cache
+                    release_rocm_field_evaluation_cache!(field_cache)
+                end
+            elseif beat_backend == :metal
+                device_cache === nothing || release_metal_regular_assembly_cache!(device_cache)
+                device_singular_cache === nothing || release_metal_singular_correction_cache!(device_singular_cache)
+                boundary_state = DEPLOY_BOUNDARY_STATE[]
+                field_retained = boundary_state !== nothing && boundary_state.field_cache === field_cache
+                if !field_retained && field_cache !== cpu_field_cache
+                    release_metal_field_evaluation_cache!(field_cache)
+                end
+            end
             cuda_identity_cache === nothing || release_cuda_burton_miller_identity_cache!(cuda_identity_cache)
             device_image_singular_cache === nothing ||
                 release_cuda_image_singular_correction_cache!(device_image_singular_cache)
