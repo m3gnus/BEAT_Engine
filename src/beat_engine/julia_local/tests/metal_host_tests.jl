@@ -27,13 +27,31 @@ include(joinpath(@__DIR__, "compiled_metal_worker_tests.jl"))
     launches = bundle.metal_coupled_launch_types()
     runtime = bundle.metal_coupled_runtime_signatures()
     rules = bundle.metal_launch_rules()
+    # Four-operator path, then the combined A/C path (the Metal coupled default). Pinned
+    # here, not read from the table, so a rule dropped from the table fails this test.
+    expected_coupled = Set((
+        core._metal_regular_pair_blocks_kernel!, core._metal_gather_slp_adjoint_kernel!,
+        core._metal_gather_dlp_hyp_kernel!, core._metal_singular_fused_blocks_kernel!,
+        core._metal_singular_pair_gather_kernel!,
+        core._metal_fused_pair_blocks_kernel!, core._metal_coupled_flux_gather_kernel!,
+        core._metal_fused_lhs_gather_kernel!, core._metal_fused_singular_packed_kernel!,
+        core._metal_singular_entry_gather_kernel!))
+    coupled_rules = Set(f for (f, rule) in rules if :coupled in rule.paths)
     # Every coupled kernel in the shared launch table has generated device signatures.
-    @test Set(f for (f, _, _, _) in launches) == Set(f for (f, rule) in rules if :coupled in rule.paths)
+    @test Set(f for (f, _, _, _) in launches) == coupled_rules
+    @test coupled_rules == expected_coupled
     @test core._metal_coupled_flux_gather_kernel! in keys(rules)
     # The exterior host inventory takes its launches from the same table. Some exterior
     # rules cover diagnostic modes the generated inventory does not record, so this is a subset.
     exterior = Set(f for (f, _, _, _) in bundle.metal_launch_types(:exterior))
-    @test !isempty(exterior) && exterior ⊆ Set(f for (f, rule) in rules if :exterior in rule.paths)
+    exterior_rules = Set(f for (f, rule) in rules if :exterior in rule.paths)
+    @test !isempty(exterior) && exterior ⊆ exterior_rules
+    # Production exterior kernels must be both in the table and in the generated inventory.
+    production_exterior = Set((
+        core._metal_fused_pair_blocks_kernel!, core._metal_fused_lhs_gather_kernel!,
+        core._metal_fused_singular_packed_kernel!, core._metal_fast_field_kernel!))
+    @test production_exterior ⊆ exterior_rules
+    @test production_exterior ⊆ exterior
     pair_orders = Set{Int}()
     for (f, tt, args, size) in launches
         @test length(args) == fieldcount(tt)
