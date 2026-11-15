@@ -148,6 +148,10 @@ function precompile_workload()
     # This bundle also serves beat_cpu coupled requests on the Mac, whose defaults
     # differ (Float32 FEM, UMFPACK): cache that configuration too.
     precompile_coupled_workload(; tiny=true, mumps=false, defaults=:cpu)
+    # Interface-radiated pressure (Boundary Lab coupled projects) retains the
+    # radiation replay; the Metal-typed variant is in MetalCoupledPrecompile.jl.
+    precompile_coupled_workload(; tiny=true, mumps=false, defaults=:cpu, radiation=true)
+    precompile_worker_startup()
     precompile(run_worker, ())
     precompile_metal_host_signatures()
     precompile_metal_runtime_signatures()

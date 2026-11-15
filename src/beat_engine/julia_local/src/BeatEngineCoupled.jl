@@ -1172,6 +1172,13 @@ function prepare_coupled_cache(
         end
         for spec in wall_impedances
     ]
+    # One concrete element type with or without wall-impedance boundaries (the
+    # empty comprehension is a Vector{Any}), so both share the cache type and
+    # therefore one compiled call graph. Values are unchanged.
+    wall_impedance_operators = convert(
+        Vector{NamedTuple{(:matrix, :thickness_m, :flow_resistivity_pa_s_per_m2),Tuple{SparseMatrixCSC{T,Int},T,T}}},
+        wall_impedance_operators,
+    )
     thermoviscous_operator = prepare_thermoviscous_operator(
         fem_mesh, thermoviscous_walls; symmetry_mode=normalized_symmetry)
     fem_matrix_cache_s = (time_ns() - fem_matrix_started) / 1.0e9

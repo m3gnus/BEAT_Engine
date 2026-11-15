@@ -28,6 +28,18 @@ const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
 const RUN_MESH_PROVENANCE = Ref{Any}([])
 const COMPILED_WORKER_LOAD = Ref{Any}(nothing)
 
+# What the entry point loaded, reported in the ready announcement and result diagnostics.
+# One constructor (and one concrete Dict type) for `coupled_solver.jl` and the precompile
+# workload, so the cached JSON writer is the one a worker uses.
+function compiled_worker_load(requested, loaded, fallback_reason)
+    return Dict{String,Union{Nothing,String}}(
+        "requested_bundle" => requested === nothing ? nothing : String(requested),
+        "loaded_bundle" => loaded === nothing ? nothing : String(nameof(loaded)),
+        "driver_mode" => loaded === nothing ? "source" : "bundle",
+        "fallback_reason" => fallback_reason,
+    )
+end
+
 function record_result_provenance!(result, request)
     diagnostics = result["diagnostics"]
     diagnostics["phasor_convention"] = phasor_convention()
@@ -824,6 +836,10 @@ function exterior_neumann(mesh, excitation, density::T, omega::T) where {T<:Abst
     return values
 end
 
+# The CPU field kernel a compiled solve uses on `backend`: BLAB_BEAT_CPU_FIELD_KERNEL (default
+# simd) on the CPU; other backends never read it, so they report the library default.
+exterior_cpu_field_kernel(backend::Symbol) = backend == :cpu ? BeatEngineCore.beat_cpu_field_kernel() : :scalar
+
 function exterior_field(points, mesh, pressure, neumann, wavenumber, cache, backend; cpu_kernel=:scalar)
     if backend == :cuda
         return evaluate_galerkin_field_cuda(points, mesh, pressure, neumann, wavenumber, cache)
@@ -1424,7 +1440,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                         push!(values, exterior_output_fields!(fields, String(output["id"]),
                             field_points_by_output, mesh, pressure, neumann, wavenumber,
                             selected_field_cache, backend, field_batch, metal_field_batch;
-                            cpu_kernel=backend == :cpu ? BeatEngineCore.beat_cpu_field_kernel() : :scalar,
+                            cpu_kernel=exterior_cpu_field_kernel(backend),
                             metal_field_points=metal_field_points))
                     end
                     push!(
@@ -1514,7 +1530,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "burton_miller_assembly" => assembly_mode,
                 "cpu_regular_kernel" => backend == :cpu ? String(cpu_regular_kernel) : nothing,
                 "cpu_singular_kernel" => backend == :cpu ? String(cpu_singular_kernel) : nothing,
-                "cpu_field_kernel" => backend == :cpu ? String(BeatEngineCore.beat_cpu_field_kernel()) : nothing,
+                "cpu_field_kernel" => backend == :cpu ? String(exterior_cpu_field_kernel(backend)) : nothing,
                 "metal_regular_kernel" => backend == :metal ?
                     (direct_metal_assembly ? "packed_fused" : String(BeatEngineCore._normalized_metal_regular_kernel_mode())) : nothing,
                 "metal_singular_kernel" => backend == :metal ?
@@ -3171,6 +3187,9 @@ function solve_request_impl(request; event_mode=false)
     metal_field_points = nothing
     pipeline_candidate = use_condensed_solver && coupled_cache !== nothing && length(pipeline_frequencies) > 1
     try
+        # CPU exterior fields use BLAB_BEAT_CPU_FIELD_KERNEL (default simd), as exterior-only solves do.
+        # Read inside the `try` so an invalid value takes the normal error and cleanup path.
+        coupled_cpu_field_kernel = exterior_cpu_field_kernel(bem_backend)
         if metal_field_batch !== nothing
             metal_field_points = BeatEngineCore.prepare_metal_field_output_points(metal_field_batch.point_sets)
         end
@@ -3525,11 +3544,12 @@ function solve_request_impl(request; event_mode=false)
                         for index in Base.axes(traces.pressure, 2)
                             values[excitation_index, index, :] = exterior_field(points, bem_mesh,
                                 traces.pressure[:, index], traces.normal_derivative[:, index],
-                                coupled_system.wavenumber, coupled_system.field_cache, bem_backend)
+                                coupled_system.wavenumber, coupled_system.field_cache, bem_backend;
+                                cpu_kernel=coupled_cpu_field_kernel)
                         end
                         values[excitation_index, end, :] = exterior_field(points, bem_mesh,
                             solution.bem_pressure, solution.bem_neumann, coupled_system.wavenumber,
-                            coupled_system.field_cache, bem_backend)
+                            coupled_system.field_cache, bem_backend; cpu_kernel=coupled_cpu_field_kernel)
                     end
                     push!(quantities, quantity_wire(output, values, "Pa",
                         ["excitation", "radiation_source", "observation"], metadata=Dict(
@@ -3556,7 +3576,8 @@ function solve_request_impl(request; event_mode=false)
                         pressures = [exterior_output_fields!(fields, String(output["id"]),
                             field_points_by_output, bem_mesh, solution.bem_pressure, solution.bem_neumann,
                             coupled_system.wavenumber, coupled_system.field_cache, bem_backend,
-                            field_batch, metal_field_batch; metal_field_points=metal_field_points)
+                            field_batch, metal_field_batch; cpu_kernel=coupled_cpu_field_kernel,
+                            metal_field_points=metal_field_points)
                             for (fields, solution) in zip(fields_by_excitation, solutions)]
                         push!(
                             quantities,
@@ -3588,43 +3609,9 @@ function solve_request_impl(request; event_mode=false)
                             combined_pressure .+= weight .* solution.bem_pressure
                             combined_neumann .+= weight .* solution.bem_neumann
                         end
-                        pressure = if bem_backend == :cuda
-                            evaluate_galerkin_field_cuda(
-                                points,
-                                bem_mesh,
-                                combined_pressure,
-                                combined_neumann,
-                                coupled_system.wavenumber,
-                                coupled_system.field_cache,
-                            )
-                        elseif bem_backend == :rocm
-                            evaluate_galerkin_field_rocm(
-                                points,
-                                bem_mesh,
-                                combined_pressure,
-                                combined_neumann,
-                                coupled_system.wavenumber,
-                                coupled_system.field_cache,
-                            )
-                        elseif bem_backend == :metal
-                            evaluate_galerkin_field_metal(
-                                points,
-                                bem_mesh,
-                                combined_pressure,
-                                combined_neumann,
-                                coupled_system.wavenumber,
-                                coupled_system.field_cache,
-                            )
-                        else
-                            evaluate_galerkin_field_cpu(
-                                points,
-                                bem_mesh,
-                                combined_pressure,
-                                combined_neumann,
-                                coupled_system.wavenumber,
-                                coupled_system.field_cache,
-                            )
-                        end
+                        pressure = exterior_field(points, bem_mesh, combined_pressure, combined_neumann,
+                            coupled_system.wavenumber, coupled_system.field_cache, bem_backend;
+                            cpu_kernel=coupled_cpu_field_kernel)
                         push!(
                             quantities,
                             quantity_wire(
@@ -3696,6 +3683,7 @@ function solve_request_impl(request; event_mode=false)
                 "coupled_bem_assembly" => hasproperty(coupled_system, :coupled_bem_assembly) ? String(coupled_system.coupled_bem_assembly) : "operators",
                 "coupled_bem_assembly_fallback_reason" => get(coupled_system, :coupled_bem_assembly_fallback_reason, nothing),
                 "coupled_host_zgemm" => BeatEngineCoupledCondensed.host_zgemm_path(),
+                "cpu_field_kernel" => bem_backend == :cpu ? String(coupled_cpu_field_kernel) : nothing,
                 "coupled_bem_image_fusion" => hasproperty(coupled_system, :coupled_bem_image_fusion) && coupled_system.coupled_bem_image_fusion,
                 "coupled_bem_max_registers" => hasproperty(coupled_system, :coupled_bem_max_registers) ? coupled_system.coupled_bem_max_registers : 0,
                 "linear_backend" => String(coupled_system.linear_backend),
@@ -4235,13 +4223,17 @@ end
 
 include(joinpath(@__DIR__, "worker_backend_availability.jl"))
 
-function run_worker()
+function worker_ready_announcement()
     ready = worker_ready(worker_backend_availability())
     ready["field_quantities"] = Dict(backend => ["pressure", "pressure_gradient_v1"] for backend in ("cpu", "cuda", "rocm"))
     ready["compiled_worker"] = COMPILED_WORKER_LOAD[]
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
     push!(ready["operations"], "reclaim")
-    println(JSON.json(ready))
+    return ready
+end
+
+function run_worker()
+    println(JSON.json(worker_ready_announcement()))
     flush(stdout)
     requests_since_cleanup = 0
     for line in eachline(stdin)

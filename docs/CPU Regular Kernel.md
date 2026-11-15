@@ -97,8 +97,8 @@ measured on x86-64 with AVX2 only.
 ## Field evaluation and singular corrections
 
 Two further CPU stages use the same design, each with its own switch, and
-the same rule: library functions default to scalar and only the CPU
-source-request driver opts in.
+the same rule: library functions default to scalar and the drivers opt in
+(see below for which).
 
 | variable | default | stage |
 |---|---|---|
@@ -111,8 +111,12 @@ and every source quadrature point, the source's pressure density
 Neither depends on the observation point. They are now formed once per call
 into contiguous arrays with the source coordinates and normals, and the sum
 over sources is a plain `@simd` reduction with the same polynomial `sincos`
-and zero-radius mask as the regular kernel. The compiled-system field paths
-in `coupled_solver.jl` keep the scalar loop.
+and zero-radius mask as the regular kernel. Compiled-system solves in
+`coupled_solver.jl` use it too: exterior-only systems, and the exterior
+pressure, interface radiated pressure and weighted-synthesis fields of coupled
+FEM-BEM solves on the CPU BEM backend. Their diagnostics report
+`cpu_field_kernel`; `BLAB_BEAT_CPU_FIELD_KERNEL=scalar` restores the scalar
+loop.
 
 **Singular corrections (fused Burton-Miller).** Each touching pair is
 integrated with a Duffy rule of 32 to 1,536 point pairs. A rule stored as

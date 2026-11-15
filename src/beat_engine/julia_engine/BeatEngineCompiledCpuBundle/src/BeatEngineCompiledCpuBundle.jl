@@ -136,6 +136,10 @@ include(joinpath(@__DIR__, "..", "..", "CompiledCoupledWorkload.jl"))
     # with the beat_cpu defaults: flux elimination, CHOLMOD interface mass,
     # Float32 FEM with UMFPACK and the refined dense LU.
     precompile_coupled_workload(; tiny=true, mumps=false, defaults=:cpu)
+    # Boundary Lab coupled projects also request interface-radiated pressure,
+    # which retains the radiation replay and changes the coupled system's type.
+    precompile_coupled_workload(; tiny=true, mumps=false, defaults=:cpu, radiation=true)
+    precompile_worker_startup()
     precompile(run_worker, ())
 end
 

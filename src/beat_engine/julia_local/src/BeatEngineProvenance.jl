@@ -10,6 +10,25 @@ const RUNTIME = Ref{Any}(nothing)
 
 file_hash(path) = path !== nothing && isfile(path) ? open(sha256, path) |> bytes2hex : nothing
 
+file_stamp(path) = (stat = Base.stat(path); (stat.size, stat.mtime))
+
+# Hashing the system image takes most of a worker's start-up (about 0.7 s for a
+# 200 MB image). A package image only loads on the system image it was built
+# against, so record that image's hash while generating the package image and
+# reuse it when the running image is the same file with the same size and
+# modification time. Anything else (no package image, another image) hashes.
+const BUILD_IMAGE = let pointer = Base.JLOptions().image_file
+    image = pointer == C_NULL ? nothing : unsafe_string(pointer)
+    ccall(:jl_generating_output, Cint, ()) == 1 && image !== nothing && isfile(image) ?
+        (path=image, stamp=file_stamp(image), sha256=file_hash(image)) : nothing
+end
+
+function image_hash(image, build=BUILD_IMAGE)
+    image !== nothing && build !== nothing && image == build.path && isfile(image) &&
+        file_stamp(image) == build.stamp && return build.sha256
+    return file_hash(image)
+end
+
 # An installed wheel lives in no checkout. Asking Git anyway costs a process
 # spawn in the first request, and on macOS without developer tools the stub
 # /usr/bin/git offers to install them.
@@ -81,7 +100,7 @@ function runtime_identity()
         "project_file" => project, "project_sha256" => file_hash(project),
         "manifest_file" => manifest !== nothing && isfile(manifest) ? manifest : nothing,
         "manifest_sha256" => file_hash(manifest), "julia_threads" => Threads.nthreads(),
-        "sysimage_file" => image, "sysimage_sha256" => file_hash(image),
+        "sysimage_file" => image, "sysimage_sha256" => image_hash(image),
         "blas_threads" => BLAS.get_num_threads(), "blas_config" => string(BLAS.get_config()),
         "machine" => Sys.MACHINE, "kernel" => string(Sys.KERNEL), "cpu_name" => Sys.CPU_NAME,
     )

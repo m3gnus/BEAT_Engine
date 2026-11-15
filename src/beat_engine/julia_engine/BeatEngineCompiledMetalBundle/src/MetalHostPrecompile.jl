@@ -101,33 +101,14 @@ function metal_host_signatures()
     # Reuse the recorded device signatures for host launches of the fused and
     # field kernels. Device arrays erase storage mode; restore the exact mode
     # used at each call site. This evaluates types only, without fake buffers.
-    shared_destination = Set((core._metal_fused_lhs_gather_kernel!,
-        core._metal_fused_rhs_reduce_kernel!, core._metal_singular_entry_gather_kernel!,
-        core._metal_singular_rhs_gather_kernel!, core._metal_sparse_scatter_kernel!))
-    launches = Set((core._metal_fused_pair_blocks_kernel!,
-        core._metal_fused_lhs_gather_kernel!, core._metal_fused_rhs_gather_kernel!,
-        core._metal_fused_rhs_reduce_kernel!, core._metal_fused_singular_packed_kernel!,
-        core._metal_singular_entry_gather_kernel!, core._metal_singular_rhs_gather_kernel!,
-        core._metal_sparse_scatter_kernel!, core._metal_weighted_field_sources_kernel!,
-        core._metal_field_eval_entries_kernel!, core._metal_field_eval_chunked_kernel!,
-        core._metal_field_reduce_partials_kernel!, core._metal_fast_field_kernel!,
-        core._metal_fast_field_sources_kernel!, core._metal_fast_field_reduce_kernel!,
-        core._metal_fast_field_outputs_kernel!, core._metal_fast_field_outputs_reduce_kernel!))
-    for (f, tt) in metal_kernel_signatures()
-        f in launches || continue
-        # fieldtypes expands fixed Vararg entries in the generated inventory.
-        args = Tuple(type <: Metal.MtlDeviceArray ?
-            Metal.MtlArray{eltype(type),ndims(type),
-                index == 1 && f in shared_destination ? Metal.SharedStorage : Metal.PrivateStorage} : type
-            for (index, type) in enumerate(fieldtypes(tt)))
-        if f !== core._metal_fused_pair_blocks_kernel!
+    for (f, tt, args, size) in metal_launch_types(:exterior)
+        if metal_launch_uses_helper(size)
             add(core._metal_launch, (typeof(f), Int, args...))
             add(core._metal_launch, (typeof(f), Int, args...); groupsize=Int)
         end
         # The pair driver uses @metal directly across untyped cache fields.
         # Compile the callable HostKernel method by type, without an instance.
-        launch_size = f === core._metal_fused_pair_blocks_kernel! ? Tuple{Int,Int} : Int
-        kwtype = NamedTuple{(:threads, :groups),Tuple{launch_size,launch_size}}
+        kwtype = NamedTuple{(:threads, :groups),Tuple{size,size}}
         push!(signatures, (Core.kwcall, (kwtype, Metal.HostKernel{typeof(f),tt}, args...)))
     end
     append!(signatures, metal_coupled_host_signatures())

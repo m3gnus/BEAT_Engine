@@ -218,10 +218,52 @@ mutable struct RefinedDenseLU
     backward_error::Float64
 end
 
+"""
+    _dense_matrix_scan(matrix) -> (finite, inf_norm, max_abs)
+
+Whether every entry is finite, `opnorm(matrix, Inf)` and `maximum(abs, matrix)`, from one
+column-major pass split into row bands across threads.
+
+`opnorm(matrix, Inf)` walks a column-major matrix row by row; at the 3,116-unknown
+Multi_region_SAWMOD system that one call took 0.10 s of a 0.17 s Float32 LU (M1 Max), and the
+separate maximum another 0.04 s. Here each row's sum still adds its columns in order, as
+`opnorm` does, so the norm is bit-identical; a maximum does not depend on order. `inf_norm` and
+`max_abs` are only meaningful when `finite` holds.
+"""
+function _dense_matrix_scan(matrix::Matrix{ComplexF64})
+    rows, columns = size(matrix)
+    rows == 0 && return (finite=true, inf_norm=0.0, max_abs=0.0)
+    band_count = clamp(cld(rows, 64), 1, Threads.nthreads())
+    bands = collect(Iterators.partition(1:rows, cld(rows, band_count)))
+    scan_band = band -> begin
+        sums = zeros(Float64, length(band))
+        finite = true
+        max_abs = 0.0
+        @inbounds for column in 1:columns
+            for (local_row, row) in enumerate(band)
+                value = matrix[row, column]
+                finite &= isfinite(value)
+                magnitude = abs(value)
+                sums[local_row] += magnitude
+                max_abs = max(max_abs, magnitude)
+            end
+        end
+        (finite, maximum(sums; init=0.0), max_abs)
+    end
+    results = length(bands) == 1 ? [scan_band(only(bands))] :
+              fetch.([Threads.@spawn(scan_band(band)) for band in bands])
+    return (
+        finite=all(result -> result[1], results),
+        inf_norm=maximum(result -> result[2], results),
+        max_abs=maximum(result -> result[3], results),
+    )
+end
+
 function RefinedDenseLU(matrix::Matrix{ComplexF64})
-    all(isfinite, matrix) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
-    refined = RefinedDenseLU(matrix, opnorm(matrix, Inf), nothing, nothing, 0, nothing, NaN)
-    if maximum(abs, matrix; init=0.0) > floatmax(Float32)
+    scan = _dense_matrix_scan(matrix)
+    scan.finite || throw(ArgumentError("dense coupled matrix has non-finite entries"))
+    refined = RefinedDenseLU(matrix, scan.inf_norm, nothing, nothing, 0, nothing, NaN)
+    if scan.max_abs > floatmax(Float32)
         _dense_fall_back!(refined, "an entry is outside the Float32 range")
     else
         candidate = lu!(ComplexF32.(matrix); check=false)

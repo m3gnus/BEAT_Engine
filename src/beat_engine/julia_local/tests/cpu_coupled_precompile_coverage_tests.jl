@@ -16,10 +16,12 @@ else
 end
 
 const CPU_COUPLED_COMPILE_BUDGET_MS = parse(Float64, get(ENV, "BLAB_CPU_COUPLED_COMPILE_BUDGET_MS", "1500"))
-const CPU_COUPLED_PATTERNS = ("BeatEngineCoupledCondensed.", "burton_miller_neumann_matrices")
+const CPU_COUPLED_PATTERNS = ("BeatEngineCoupledCondensed.", "BeatEngineInterfaceRadiation.",
+    "burton_miller_neumann_matrices")
 
 function cpu_coupled_compile_trace(directory, tag; bundle::Bool)
-    request = Bundle.coupled_workload_request(; bem_backend="cpu")
+    # Boundary Lab coupled projects also request interface-radiated pressure.
+    request = Bundle.coupled_workload_request(; bem_backend="cpu", radiation=true)
     request_path = joinpath(directory, "request-$tag.json")
     write(request_path, JSON.json(request))
     trace = joinpath(directory, "trace-$tag.jl")

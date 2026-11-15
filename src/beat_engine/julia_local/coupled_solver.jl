@@ -55,11 +55,10 @@ if BEAT_COMPILED_BUNDLE === nothing
 end
 
 const DRIVER = BEAT_COMPILED_BUNDLE === nothing ? Main : BEAT_COMPILED_BUNDLE
-DRIVER.COMPILED_WORKER_LOAD[] = Dict(
-    "requested_bundle" => BEAT_COMPILED_BUNDLE_NAME === nothing ? nothing : String(BEAT_COMPILED_BUNDLE_NAME),
-    "loaded_bundle" => BEAT_COMPILED_BUNDLE === nothing ? nothing : String(nameof(BEAT_COMPILED_BUNDLE)),
-    "driver_mode" => BEAT_COMPILED_BUNDLE === nothing ? "source" : "bundle",
-    "fallback_reason" => BEAT_COMPILED_BUNDLE !== nothing ? nothing :
+DRIVER.COMPILED_WORKER_LOAD[] = DRIVER.compiled_worker_load(
+    BEAT_COMPILED_BUNDLE_NAME,
+    BEAT_COMPILED_BUNDLE,
+    BEAT_COMPILED_BUNDLE !== nothing ? nothing :
         get(ENV, "BLAB_BEAT_ENGINE_BUNDLE", "1") == "0" ? "disabled_by_environment" :
         BEAT_COMPILED_BUNDLE_NAME === nothing ? "backend_has_no_compiled_bundle" : BEAT_COMPILED_BUNDLE_ERROR[],
 )

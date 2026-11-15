@@ -106,6 +106,30 @@ end
     end
 end
 
+@testset "BEAT system image hash reuses the package-image build's hash" begin
+    mktempdir() do directory
+        fixture = Module(:ImageHashFixture)
+        Base.include(fixture, joinpath(@__DIR__, "..", "src", "BeatEngineProvenance.jl"))
+        provenance = Base.invokelatest(() -> fixture.BeatEngineProvenance)
+        image_hash(args...) = Base.invokelatest(provenance.image_hash, args...)
+        # Not generating a package image here, so nothing was recorded.
+        @test provenance.BUILD_IMAGE === nothing
+        image = joinpath(directory, "sys.dylib")
+        write(image, "image bytes")
+        actual = Base.invokelatest(provenance.file_hash, image)
+        build = (path=image, stamp=Base.invokelatest(provenance.file_stamp, image), sha256="recorded")
+        @test image_hash(image) == actual
+        @test image_hash(image, build) == "recorded"
+        @test image_hash(nothing, build) === nothing
+        other = joinpath(directory, "other.dylib")
+        write(other, "image bytes")
+        @test image_hash(other, build) == actual
+        # A rewritten image (size or modification time changed) is hashed again.
+        write(image, "rewritten image bytes")
+        @test image_hash(image, build) == Base.invokelatest(provenance.file_hash, image)
+    end
+end
+
 @testset "BEAT worker negotiation" begin
     info = worker_ready(Dict("cpu" => Dict("available" => true, "reason" => "")))
     @test info["protocol"]["version"] == 1
