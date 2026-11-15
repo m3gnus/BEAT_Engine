@@ -508,7 +508,12 @@ function metal_coupled_closure_types(types=metal_coupled_types())
         resolved_transducer_operators=types.transducer_operators,
         fem_task_s=Base.RefValue{Float64}))
     fem_task = fem_stage === nothing ? nothing : metal_captured_closure_type(cc, (; fem_stage=fem_stage))
-    return (; timed_flux, timed_dense, solution_parts, fem_stage, fem_task)
+    # RefinedDenseLU's one-pass matrix scan spawns one task per row band. The package
+    # build runs single-threaded, so the workload never spawns one: name the task body.
+    dense_scan_band = metal_captured_closure_type(cc, (; matrix=Matrix{ComplexF64}, columns=Int))
+    dense_scan_task = dense_scan_band === nothing ? nothing :
+        metal_captured_closure_type(cc, (; band=UnitRange{Int}, scan_band=dense_scan_band))
+    return (; timed_flux, timed_dense, solution_parts, fem_stage, fem_task, dense_scan_band, dense_scan_task)
 end
 
 function metal_coupled_runtime_signatures()
@@ -525,6 +530,7 @@ function metal_coupled_runtime_signatures(types)
     signatures = Type[]
     # Entries whose closure could not be resolved are skipped (see metal_captured_closure_type).
     closures.fem_task === nothing || push!(signatures, Tuple{closures.fem_task})
+    closures.dense_scan_task === nothing || push!(signatures, Tuple{closures.dense_scan_task})
     closures.timed_flux === nothing ||
         push!(signatures, Tuple{typeof(cc._split_timed!), closures.timed_flux, Dict{Symbol,Float64}, Symbol})
     closures.timed_dense === nothing ||

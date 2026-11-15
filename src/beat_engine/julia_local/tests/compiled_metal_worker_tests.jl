@@ -63,6 +63,8 @@ end
               typeof(cc.solve_condensed_coupled_excitations), host)
     @test (cc.release_condensed_coupled_system!, (types.system,)) in host
     @test Tuple{typeof(collect), Base.Generator{Base.OneTo{Int},closures.solution_parts}} in runtime
+    @test fieldtype(closures.dense_scan_task, :scan_band) === closures.dense_scan_band
+    @test Tuple{closures.dense_scan_task} in runtime
     @test mumps.LIBRARY[] === library_before
     @test mumps.LIVE_SOLVERS == solvers_before
 end
