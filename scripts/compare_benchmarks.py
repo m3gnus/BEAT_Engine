@@ -95,6 +95,11 @@ def main():
     parser.add_argument("--stage", action="append", required=True, help="LABEL=GLOB")
     parser.add_argument("--reference", type=Path, help="run JSON to measure accuracy against")
     parser.add_argument("--variance", type=float, help="established run-to-run half-range, percent")
+    parser.add_argument(
+        "--allow-mixed-warmup",
+        action="store_true",
+        help="compare runs taken with different --warmup settings (cold and warmed sweeps)",
+    )
     args = parser.parse_args()
     reference = json.loads(args.reference.read_text()) if args.reference else None
 
@@ -105,6 +110,12 @@ def main():
         if not runs:
             raise SystemExit(f"no runs match {pattern!r}")
         stages.append((label, runs))
+    # A cold sweep (--warmup none) includes run-time compilation a warmed one does not.
+    warmups = {run.get("warmup", "two") for _, runs in stages for run in runs}
+    if len(warmups) > 1 and not args.allow_mixed_warmup:
+        parser.error(
+            f"runs differ in --warmup ({', '.join(sorted(warmups))}); pass --allow-mixed-warmup to compare them"
+        )
 
     first_median = statistics.median(r["wall_s"] for r in stages[0][1])
     for label, runs in stages:

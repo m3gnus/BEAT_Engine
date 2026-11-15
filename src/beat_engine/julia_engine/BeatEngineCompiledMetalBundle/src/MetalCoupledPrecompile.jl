@@ -2,7 +2,10 @@
 # NamedTuple values below are types, not caches, factors or device buffers.
 _metal_namedtuple_type(fields::NamedTuple) = NamedTuple{keys(fields),Tuple{values(fields)...}}
 
-function metal_coupled_types()
+# `radiation_replay=true` is the system a request with an `interface_radiated_pressure`
+# output builds (`retain_interface_radiation`, which Boundary Lab coupled projects send):
+# the host LU of the BEM block and the interface block are kept for the replay.
+function metal_coupled_types(; radiation_replay::Bool=false)
     core = BeatEngineCore
     coupled = BeatEngineCoupled
     cc = BeatEngineCoupledCondensed
@@ -34,7 +37,8 @@ function metal_coupled_types()
         mass=SparseArrays.SparseMatrixCSC{Float32, Int},
         bulk_loss_mass=SparseArrays.SparseMatrixCSC{Float32, Int},
         bulk_loss_factor_by_vertex=Vector{Float32},
-        wall_impedance_operators=Vector{Any},
+        wall_impedance_operators=Vector{NamedTuple{(:matrix, :thickness_m, :flow_resistivity_pa_s_per_m2),
+            Tuple{SparseArrays.SparseMatrixCSC{Float32, Int}, Float32, Float32}}},
         thermoviscous_operator=Nothing,
         interface_operators=coupled.InterfaceOperators{Float32},
         p1=core.P1Space,
@@ -191,7 +195,10 @@ function metal_coupled_types()
         bem_lhs=Nothing,
         bem_factorization=Nothing,
         bem_rhs_operator=Nothing,
-        interface_radiation_replay=Nothing,
+        interface_radiation_replay=radiation_replay ? _metal_namedtuple_type((;
+            factorization=LinearAlgebra.LU{ComplexF32, Matrix{ComplexF32}, Vector{Int}},
+            interface_block=Matrix{ComplexF32},
+        )) : Nothing,
         prescribed_bem_rhs=Matrix{ComplexF32},
         prescribed_bem_neumann=SparseArrays.SparseMatrixCSC{ComplexF32, Int},
         bem_backend=Symbol,
@@ -293,11 +300,21 @@ function metal_coupled_types()
         combined_identity, combined_device, combined_operators)
 end
 
+# Both coupled system variants: without and with the interface-radiation replay.
+metal_coupled_type_variants() = (metal_coupled_types(), metal_coupled_types(; radiation_replay=true))
+
 function metal_coupled_host_signatures()
+    signatures = Tuple{Any,Tuple}[]
+    for types in metal_coupled_type_variants()
+        append!(signatures, metal_coupled_host_signatures(types))
+    end
+    return unique!(signatures)
+end
+
+function metal_coupled_host_signatures(types)
     core = BeatEngineCore
     coupled = BeatEngineCoupled
     cc = BeatEngineCoupledCondensed
-    types = metal_coupled_types()
     regular = core.MetalRegularAssemblyCache{Float32,Nothing}
     singular = core.MetalSingularCorrectionCache{Float32}
     signatures = Tuple{Any,Tuple}[]
@@ -314,7 +331,7 @@ function metal_coupled_host_signatures()
         (coupled.VolumeMesh{Float32}, core.BoundaryMesh{Float32},
          coupled.ConformingInterfaceMap, Float32, Float32, Float32);
         quadrature_order=Int, regular_quadrature_order=Int, singular_order=Int,
-        cache=types.cache, validation_diagnostics=Bool, retain_interface_radiation=Bool,
+        cache=types.cache, bem_backend=Symbol, validation_diagnostics=Bool, retain_interface_radiation=Bool,
         symmetry_mode=Symbol, bulk_loss_factor_by_vertex=Vector{Float32},
         wall_impedances=Vector{NamedTuple}, thermoviscous_walls=Vector{NamedTuple},
         transducers=Vector{coupled.ElectrodynamicTransducer{Float32}},
@@ -330,6 +347,10 @@ function metal_coupled_host_signatures()
         (Dict{Symbol,Any}, coupled.VolumeMesh{Float32}, types.prepared,
          Float32, Float32, Float32))
     add(cc.release_condensed_coupled_system!, (types.system,))
+    # `interface_radiated_pressure` outputs, once per solution, with the driver's interface ranges.
+    fieldtype(types.system, :interface_radiation_replay) === Nothing ||
+        add(BeatEngineInterfaceRadiation.interface_radiation_traces,
+            (types.system, types.solution, Vector{UnitRange{Int}}); include_other=Bool)
     add(cc.interface_mass_diagnostics, (types.system,))
     add(cc.dense_solver_diagnostics, (types.system,))
     add(_condensed_split_timings, (types.system, Vector{types.solution}))
@@ -382,8 +403,30 @@ function metal_coupled_host_signatures()
         (types.host_operators, Matrix{Float32}, Matrix{Float32}, Float32))
     add(core.release_operator_storage!, (types.host_operators,))
 
+    # Combined A/C assembly launches (`BeatEngineMetalCoupledBurtonMiller.jl`): the pair and
+    # singular drivers with the production storage modes, and the table caches they fill.
+    shared_matrix = Metal.MtlArray{ComplexF32, 2, Metal.SharedStorage}
+    private_vector(T) = Metal.MtlArray{T, 1, Metal.PrivateStorage}
+    add(core._launch_metal_coupled_pair_kernels!,
+        (shared_matrix, shared_matrix, private_vector(Float32), regular, Float32,
+         private_vector(Int32), private_vector(Int32), Int32, ntuple(_ -> Float32, 6)...))
+    add(core._launch_metal_coupled_singular_kernels!, (shared_matrix, shared_matrix, regular, singular, Float32))
+    add(core._launch_metal_coupled_singular_kernels!,
+        (shared_matrix, shared_matrix, regular, singular, Float32, core.SymmetryTransform))
+    add(core._metal_packed_pair_tables_for, (regular,))
+    add(core._metal_fused_singular_tables_for, (regular, singular))
+    # Final scaling of the combined blocks: `c .*= -one(T)` without symmetry, and the
+    # symmetry row weights (`a .*= weights`, `c .= .-c .* weights`).
+    weights = Metal.MtlArray{ComplexF32, 2, Metal.PrivateStorage}
+    style = Metal.MtlArrayStyle{2, Metal.SharedStorage}
+    product(operands...) = Base.Broadcast.Broadcasted{style, Nothing, typeof(*), Tuple{operands...}}
+    for broadcast in (product(shared_matrix, Float32), product(shared_matrix, weights),
+                      product(Base.Broadcast.Broadcasted{style, Nothing, typeof(-), Tuple{shared_matrix}}, weights))
+        add(Base.Broadcast.materialize!, (style, shared_matrix, broadcast))
+    end
+
     for (f, tt, args, size) in metal_coupled_launch_types()
-        if f !== core._metal_regular_pair_blocks_kernel!
+        if metal_launch_uses_helper(size)
             add(core._metal_launch, (typeof(f), Int, args...))
             add(core._metal_launch, (typeof(f), Int, args...); groupsize=Int)
         end
@@ -395,27 +438,7 @@ function metal_coupled_host_signatures()
     return signatures
 end
 
-function metal_coupled_launch_types()
-    core = BeatEngineCore
-    kernels = (core._metal_regular_pair_blocks_kernel!, core._metal_gather_slp_adjoint_kernel!,
-        core._metal_gather_dlp_hyp_kernel!, core._metal_singular_fused_blocks_kernel!,
-        core._metal_singular_pair_gather_kernel!)
-    shared_pair = (core._metal_gather_slp_adjoint_kernel!, core._metal_gather_dlp_hyp_kernel!,
-        core._metal_singular_pair_gather_kernel!)
-    launches = Tuple{Any,Type,Tuple,Type}[]
-    for (f, tt) in metal_kernel_signatures()
-        f in kernels || continue
-        # Gather destinations (the first two arguments) are shared. Geometry,
-        # indices and intermediate blocks are private. Expand fixed Varargs.
-        args = Tuple(type <: Metal.MtlDeviceArray ?
-            Metal.MtlArray{eltype(type),ndims(type),
-                index <= 2 && f in shared_pair ? Metal.SharedStorage : Metal.PrivateStorage} : type
-            for (index, type) in enumerate(fieldtypes(tt)))
-        size = f === core._metal_regular_pair_blocks_kernel! ? Tuple{Int,Int} : Int
-        push!(launches, (f, tt, args, size))
-    end
-    return launches
-end
+metal_coupled_launch_types() = metal_launch_types(:coupled)
 
 # Match a compiler-generated closure by its captured fields, then bind each
 # type parameter through the field it represents. Fixed Core.Box fields are
@@ -459,9 +482,8 @@ function metal_captured_closure_type(mod::Module, captures::NamedTuple)
     return only(candidates)
 end
 
-function metal_coupled_closure_types()
+function metal_coupled_closure_types(types=metal_coupled_types())
     cc = BeatEngineCoupledCondensed
-    types = metal_coupled_types()
     timed_flux = metal_captured_closure_type(cc, (;
         system=types.system, flux_rhs_solution=Core.Box,
         rhs=Matrix{ComplexF64}, elimination=types.elimination))
@@ -490,10 +512,17 @@ function metal_coupled_closure_types()
 end
 
 function metal_coupled_runtime_signatures()
-    cc = BeatEngineCoupledCondensed
-    types = metal_coupled_types()
-    closures = metal_coupled_closure_types()
     signatures = Type[Tuple{typeof(getproperty), BeatEngineCore.MetalGatherTables, Symbol}]
+    for types in metal_coupled_type_variants()
+        append!(signatures, metal_coupled_runtime_signatures(types))
+    end
+    return unique!(signatures)
+end
+
+function metal_coupled_runtime_signatures(types)
+    cc = BeatEngineCoupledCondensed
+    closures = metal_coupled_closure_types(types)
+    signatures = Type[]
     # Entries whose closure could not be resolved are skipped (see metal_captured_closure_type).
     closures.fem_task === nothing || push!(signatures, Tuple{closures.fem_task})
     closures.timed_flux === nothing ||

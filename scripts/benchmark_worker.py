@@ -5,7 +5,9 @@ request absorbs most JIT compilation, then --repeats timed sweeps run in that sa
 warm worker. Both entry points rebuild their per-request caches for every request.
 Sweep 1 matches a fresh worker's sweep, including one-off costs the short warm-up
 does not trigger; later sweeps are steady state and can be faster. Compare sweep 1
-with sweep 1, or repeats with repeats. The result JSON records wall
+with sweep 1, or repeats with repeats. --warmup none skips the warm-up, so sweep 1
+is exactly what a fresh worker's first request pays (the cold first frequency);
+each frequency row keeps its result's arrival time after submission. The result JSON records wall
 time, every per-frequency section timing the worker reports, worker memory, the
 effective diagnostics, and the complex outputs (for accuracy against a reference).
 See docs/Benchmarking.md for the procedure; compare runs with compare_benchmarks.py.
@@ -218,7 +220,8 @@ def submit(worker, request, path: Path):
     rows, started = [], time.perf_counter()
     for event in worker.submit(path):
         if event["type"] == "result":
-            rows.append(event["result"])
+            # Seconds from submission to this result's arrival, kept beside the row.
+            rows.append({**event["result"], "_arrival_s": time.perf_counter() - started})
         elif event["type"] == "failed":
             raise SystemExit(f"FAILED {path.name}: {event.get('error')}")
     return time.perf_counter() - started, rows
@@ -240,6 +243,12 @@ def main():
         "--advertise-metal", action="store_true", help="for workers that run Metal but predate advertising it"
     )
     parser.add_argument("--repeats", type=int, default=1, help="timed sweeps in the one warm worker")
+    parser.add_argument(
+        "--warmup",
+        choices=("two", "none"),
+        default="two",
+        help="'none' times sweep 1 in a fresh worker with no warm-up request (cold first frequency)",
+    )
     parser.add_argument(
         "--out", type=Path, required=True, help="run JSON; with --repeats N > 1, one file per sweep as <out>_r<i>.json"
     )
@@ -275,9 +284,11 @@ def main():
                 "metal", {"available": True, "reason": "", "phasor_conventions": ["exp(-i omega t)"]}
             )
         freqs = list(args.frequencies)
-        warmup_s, _ = submit(
-            worker, build([freqs[len(freqs) // 4], freqs[3 * len(freqs) // 4]]), scratch / "warmup.json"
-        )
+        warmup_s = None
+        if args.warmup == "two":
+            warmup_s, _ = submit(
+                worker, build([freqs[len(freqs) // 4], freqs[3 * len(freqs) // 4]]), scratch / "warmup.json"
+            )
         sweeps = []
         for repeat in range(args.repeats):
             memory = PeakMemory(worker._process.pid)
@@ -302,6 +313,7 @@ def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, befo
             {
                 "freq_hz": float(result["freq_hz"]),
                 "requested_freq_hz": float(requested_frequency),
+                "arrival_s": result.get("_arrival_s"),
                 "timings": {k: v for k, v in timings.items() if isinstance(v, (int, float))},
                 "diagnostics": {k: v for k, v in diagnostics.items() if isinstance(v, (int, float, str, bool))},
             }
@@ -316,6 +328,7 @@ def write_run(out, args, commit, startup_s, warmup_s, repeat, wall_s, rows, befo
         "threads": args.threads,
         "host": platform.machine(),
         "startup_s": startup_s,
+        "warmup": getattr(args, "warmup", "two"),
         "warmup_s": warmup_s,
         "repeat_in_worker": repeat,
         "wall_s": wall_s,

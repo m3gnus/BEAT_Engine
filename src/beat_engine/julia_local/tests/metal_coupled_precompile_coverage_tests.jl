@@ -14,15 +14,17 @@ const Bundle = BeatEngineCompiledMetalBundle
 # compiled ~0.9 s outside this filter); a stale inventory puts several seconds back.
 const COUPLED_COMPILE_BUDGET_MS = parse(Float64, get(ENV, "BLAB_COUPLED_COMPILE_BUDGET_MS", "1500"))
 const COUPLED_PATTERNS = (
-    "BeatEngineCoupledCondensed.", "metal_host_operators", "burton_miller_neumann_matrices",
-    "_launch_metal_", "_apply_metal_operator_p1_row_weights!", "release_operator_storage!",
+    "BeatEngineCoupledCondensed.", "BeatEngineInterfaceRadiation.", "metal_host_operators",
+    "burton_miller_neumann_matrices", "_launch_metal_", "_apply_metal_operator_p1_row_weights!",
+    "release_operator_storage!",
 )
 
 # Trace one fresh worker solving the packaged coupled request with Metal BEM assembly. `bundle=true`
 # loads the compiled bundle (what a worker does); `bundle=false` takes the supported source fallback
 # (`BLAB_BEAT_ENGINE_BUNDLE=0`), which compiles the coupled path at run time.
 function coupled_compile_trace(directory, tag; bundle::Bool)
-    request = Bundle.coupled_workload_request(; bem_backend="metal")
+    # Boundary Lab coupled projects also request interface-radiated pressure.
+    request = Bundle.coupled_workload_request(; bem_backend="metal", radiation=true)
     request_path = joinpath(directory, "request-$tag.json")
     write(request_path, JSON.json(request))
     trace = joinpath(directory, "trace-$tag.jl")

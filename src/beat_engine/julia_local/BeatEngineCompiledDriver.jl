@@ -28,6 +28,18 @@ const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
 const RUN_MESH_PROVENANCE = Ref{Any}([])
 const COMPILED_WORKER_LOAD = Ref{Any}(nothing)
 
+# What the entry point loaded, reported in the ready announcement and result diagnostics.
+# One constructor (and one concrete Dict type) for `coupled_solver.jl` and the precompile
+# workload, so the cached JSON writer is the one a worker uses.
+function compiled_worker_load(requested, loaded, fallback_reason)
+    return Dict{String,Union{Nothing,String}}(
+        "requested_bundle" => requested === nothing ? nothing : String(requested),
+        "loaded_bundle" => loaded === nothing ? nothing : String(nameof(loaded)),
+        "driver_mode" => loaded === nothing ? "source" : "bundle",
+        "fallback_reason" => fallback_reason,
+    )
+end
+
 function record_result_provenance!(result, request)
     diagnostics = result["diagnostics"]
     diagnostics["phasor_convention"] = phasor_convention()
@@ -4235,13 +4247,17 @@ end
 
 include(joinpath(@__DIR__, "worker_backend_availability.jl"))
 
-function run_worker()
+function worker_ready_announcement()
     ready = worker_ready(worker_backend_availability())
     ready["field_quantities"] = Dict(backend => ["pressure", "pressure_gradient_v1"] for backend in ("cpu", "cuda", "rocm"))
     ready["compiled_worker"] = COMPILED_WORKER_LOAD[]
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
     push!(ready["operations"], "reclaim")
-    println(JSON.json(ready))
+    return ready
+end
+
+function run_worker()
+    println(JSON.json(worker_ready_announcement()))
     flush(stdout)
     requests_since_cleanup = 0
     for line in eachline(stdin)

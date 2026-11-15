@@ -73,7 +73,10 @@ function tiny_coupled_workload_meshes()
     return fem, bem
 end
 
-function coupled_workload_request(; tiny::Bool=false, bem_backend::String="cpu")
+# `radiation=true` adds the `interface_radiated_pressure` output Boundary Lab coupled
+# projects request; it retains the interface-radiation replay, which changes the
+# coupled system's type and therefore the compiled call graph.
+function coupled_workload_request(; tiny::Bool=false, bem_backend::String="cpu", radiation::Bool=false)
     root = joinpath(ENGINE_DIR, "tests", "fixtures")
     fem_resource, bem_resource = if tiny
         tiny_coupled_workload_meshes()
@@ -153,6 +156,8 @@ function coupled_workload_request(; tiny::Bool=false, bem_backend::String="cpu")
             output("mechanical:diaphragm-velocity", "diaphragm_velocity", ["components:electrodynamic-transducers"]),
             output("electrical:voice-coil-current", "voice_coil_current", ["components:electrodynamic-transducers"]),
             output("acoustic:interface-average-normal-velocity", "interface_average_normal_velocity", ["domain:interfaces"]),
+            (radiation ? [output("acoustic:interface-radiated-pressure", "interface_radiated_pressure",
+                ["domain:radiation-sources"]; options=Dict("points_m" => [[0.0, 0.0, 1.0]]))] : [])...,
         ],
         "solver_options" => Dict("precision" => "float32", "bem_backend" => bem_backend,
             "quadrature_order" => 1, "singular_order" => 1, "regular_quadrature_mode" => "fixed",
@@ -217,7 +222,7 @@ function solve_coupled_workload(request)
     end
 end
 
-function check_coupled_workload(run; mumps::Bool, defaults::Symbol=:metal)
+function check_coupled_workload(run; mumps::Bool, defaults::Symbol=:metal, radiation::Bool=false)
     @assert !run.outcome.cancelled
     @assert run.outcome.solved_count == 2 && length(run.results) == 2
     for result in run.results
@@ -233,6 +238,17 @@ function check_coupled_workload(run; mumps::Bool, defaults::Symbol=:metal)
         @assert d["fem_interior_reconstruction"] == "skipped" d
         @assert isempty(d["coupled_optimization_fallback_reasons"]) d
         @assert d["dense_solver"] in ("lu_float32_refined", "lu_float64_fallback") d
+        # The radiation request must reach the retained replay and its output, or the
+        # package image silently loses that call graph.
+        radiated = [q for q in result["quantities"] if q["quantity"] == "interface_radiated_pressure"]
+        @assert length(radiated) == (radiation ? 1 : 0) result["quantities"]
+        if radiation
+            @assert d["interface_radiation_backend"] == "cpu" d
+            errors = d["interface_radiation_boundary_reconstruction_relative_error"]
+            @assert errors isa AbstractVector && length(errors) == 1 && all(isfinite, errors) d
+        else
+            @assert d["interface_radiation_backend"] === nothing d
+        end
         if d["dense_solver"] == "lu_float64_fallback"
             @warn "BEAT coupled workload refinement fell back" reason=d["dense_refinement_fallback_reason"]
         end
@@ -263,14 +279,14 @@ function reset_compiled_workload_state!()
     return nothing
 end
 
-function precompile_coupled_workload(; tiny::Bool, mumps::Bool, defaults::Symbol=:metal)
+function precompile_coupled_workload(; tiny::Bool, mumps::Bool, defaults::Symbol=:metal, radiation::Bool=false)
     try
-        request = JSON.parse(JSON.json(coupled_workload_request(; tiny)))
+        request = JSON.parse(JSON.json(coupled_workload_request(; tiny, radiation)))
         withenv(coupled_workload_environment(; mumps, defaults)...) do
-            check_coupled_workload(solve_coupled_workload(request); mumps, defaults)
+            check_coupled_workload(solve_coupled_workload(request); mumps, defaults, radiation)
         end
     catch exception
-        @warn "BEAT compiled coupled workload failed" tiny mumps defaults exception=(exception, catch_backtrace())
+        @warn "BEAT compiled coupled workload failed" tiny mumps defaults radiation exception=(exception, catch_backtrace())
     finally
         try
             reset_compiled_workload_state!()
@@ -278,4 +294,29 @@ function precompile_coupled_workload(; tiny::Bool, mumps::Bool, defaults::Symbol
             @warn "BEAT compiled coupled workload cleanup failed" exception=(exception, catch_backtrace())
         end
     end
+end
+
+# Worker start-up and project meshes. The ready announcement is built from run-time
+# values (backend probes, provenance, the parsed contract), so its JSON writer
+# specializations are not inferred from `run_worker`; write the real one. Boundary
+# Lab project FEM meshes are gmsh 4.1 files, which the inline workload meshes skip.
+function precompile_worker_startup()
+    load = COMPILED_WORKER_LOAD[]
+    try
+        # What the entry point (`coupled_solver.jl`) records when this bundle loads.
+        COMPILED_WORKER_LOAD[] = compiled_worker_load(nameof(@__MODULE__), @__MODULE__, nothing)
+        JSON.json(worker_ready_announcement())
+    catch exception
+        @warn "BEAT compiled worker start-up workload failed" exception=(exception, catch_backtrace())
+    finally
+        COMPILED_WORKER_LOAD[] = load
+        provenance = BeatEngineContract.BeatEngineProvenance
+        provenance.IDENTITY[] = nothing
+        provenance.RUNTIME[] = nothing
+    end
+    for T in (Float32, Float64)
+        precompile(BeatEngineCoupled.load_gmsh41_volume, (String, T)) ||
+            @warn "BEAT compiled worker gmsh 4.1 volume reader did not precompile" T
+    end
+    return nothing
 end

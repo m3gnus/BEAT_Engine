@@ -132,6 +132,19 @@ end
     @test bundle.BeatEngineContract.BeatEngineProvenance.RUNTIME[] === nothing
 end
 
+@testset "compiled bundle reports the running system image's hash" begin
+    provenance = CompiledWorkloadBundle.BeatEngineContract.BeatEngineProvenance
+    image = unsafe_string(Base.JLOptions().image_file)
+    build = provenance.BUILD_IMAGE
+    # Recorded while the package image was generated, on the image it loads with.
+    @test build !== nothing && build.path == image
+    try
+        @test provenance.runtime_identity()["sysimage_sha256"] == provenance.file_hash(image)
+    finally
+        provenance.RUNTIME[] = nothing
+    end
+end
+
 # The CPU compiled entry is only declared in the CPU project.
 if COMPILED_WORKLOAD_PROJECT == "julia_local"
 @testset "tiny coupled request solves through compiled CPU entry and fallback" begin
@@ -251,4 +264,28 @@ end
         @test all(result["diagnostics"]["fem_matrix_precision"] == "float32" for result in run.results)
     end
     bundle.reset_compiled_workload_state!()
+end
+
+@testset "tiny coupled workload with interface radiation solves (strict)" begin
+    bundle = CompiledWorkloadBundle
+    request = bundle.JSON.parse(bundle.JSON.json(bundle.coupled_workload_request(; tiny=true, radiation=true)))
+    withenv(bundle.coupled_workload_environment(; mumps=false, defaults=:cpu)...) do
+        run = bundle.solve_coupled_workload(request)
+        bundle.check_coupled_workload(run; mumps=false, defaults=:cpu, radiation=true)
+        @test all(length(result["quantities"]) == 5 for result in run.results)
+        # A request without the output must fail the radiation check, and the reverse.
+        @test_throws AssertionError bundle.check_coupled_workload(run; mumps=false, defaults=:cpu)
+    end
+    bundle.reset_compiled_workload_state!()
+end
+
+@testset "compiled worker load record has one shape" begin
+    bundle = CompiledWorkloadBundle
+    loaded = bundle.compiled_worker_load(nameof(bundle), bundle, nothing)
+    @test loaded isa Dict{String,Union{Nothing,String}}
+    @test loaded == Dict("requested_bundle" => string(nameof(bundle)), "loaded_bundle" => string(nameof(bundle)),
+                         "driver_mode" => "bundle", "fallback_reason" => nothing)
+    source = bundle.compiled_worker_load(nothing, nothing, "backend_has_no_compiled_bundle")
+    @test source isa Dict{String,Union{Nothing,String}}
+    @test source["driver_mode"] == "source" && source["requested_bundle"] === nothing
 end

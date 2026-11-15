@@ -68,6 +68,25 @@ have no robust structural handle. With it, the first request falls to 3.9 +
 coupled sweep pipeline starts) pass the driver's producer closure as
 `bem_operators` and compile that call once; they are not in the inventory.
 
+Boundary Lab coupled projects also request `interface_radiated_pressure`,
+which retains the interface-radiation replay (a host LU of the BEM block) and
+so changes the coupled system's type. The inventory therefore covers both
+system variants, with and without the replay, plus `interface_radiation_traces`;
+the shared workload's `radiation=true` request (run by both bundles, and by
+the two coverage gates) exercises the same output. The combined A/C assembly
+(the Metal coupled default) has its own pair and singular launch drivers,
+packed-table caches, final scaling broadcasts (with and without symmetry) and kernels
+(`_metal_coupled_flux_gather_kernel!`, the packed singular groups by point
+count); the kernel inventory generator solves the coupled workload request at
+orders 1/2/4 so those device signatures are cached too. Host launch storage
+modes and grid shapes for both inventories come from one table,
+`metal_launch_rules()` in `MetalKernelPrecompile.jl`. Measured on an M1 Max
+with the requests of Boundary Lab's example projects `F2B_FLH` and
+`Multi_region_SAWMOD`, a stale
+inventory (a keyword added to the build call, the replay variant and the
+combined kernels missing) had put about 7 s of compilation back on the first
+frequency.
+
 When a closure's captured fields no longer match (the source changed), the
 package build warns, names the capture set and skips the entries that depend on
 it; it never fails the build. The strict check runs in CI:
