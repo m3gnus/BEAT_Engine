@@ -66,11 +66,20 @@ function validate_mesh_sources(system)
     end
 end
 
+"""
+    payload_sha256(text) -> hex digest of the string's bytes
+
+SHA.jl hashes a `String` through `codeunits`, whose 64-byte block copies each check aliasing with
+`objectid`, which hashes the whole string: quadratic in its length. A 5.6 MB inline mesh request
+spent about 85 s here (M1 Max). Hashing a byte copy gives the same digest in linear time.
+"""
+payload_sha256(text::AbstractString) = bytes2hex(sha256(Vector{UInt8}(text)))
+
 function mesh_provenance(mesh, file_hash)
     if haskey(mesh, "mesh_data")
         # Request JSON is retained by the host; hash the actual received payload.
         return Dict("id" => mesh["id"], "source" => "memory", "file" => nothing,
-                    "sha256" => bytes2hex(sha256(JSON.json(mesh["mesh_data"]))))
+                    "sha256" => payload_sha256(JSON.json(mesh["mesh_data"])))
     end
     return Dict("id" => mesh["id"], "file" => mesh["file"], "sha256" => file_hash(mesh["file"]))
 end

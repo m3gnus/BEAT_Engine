@@ -41,6 +41,18 @@ indices(rows) = reduce(vcat, [permutedims(collect(row) .- 1) for row in rows])
     @test translated_volume_mesh(resource, Float64).vertices == [v + SVector(1., 2., 3.) for v in memory_fem.vertices]
 end
 
+@testset "memory mesh provenance hashes the received payload" begin
+    fem = load_gmsh41_volume(joinpath(@__DIR__, "fixtures", "femvolume.msh"), 1.0)
+    names = Dict(name => [tag, dim] for ((dim, tag), name) in fem.physical_names)
+    raw = payload(fem.vertices, [("tetra", indices(fem.tetrahedra), fem.tetra_physical_tags)], names)
+    text = BeatEngineContract.BeatEngineMeshData.JSON.json(raw)
+    record = BeatEngineContract.BeatEngineMeshData.mesh_provenance(Dict("id" => "mesh:fem", "mesh_data" => raw), nothing)
+    @test record["source"] == "memory" && record["file"] === nothing
+    # The digest of the payload's bytes: unchanged from hashing the string itself.
+    @test record["sha256"] == bytes2hex(BeatEngineContract.BeatEngineMeshData.sha256(text))
+    @test record["sha256"] == bytes2hex(BeatEngineContract.BeatEngineMeshData.sha256(Vector{UInt8}(text)))
+end
+
 @testset "quadratic memory ordering matches Gmsh kernel ordering" begin
     vertices = [SVector{3,Float64}(0,0,0), SVector{3,Float64}(1,0,0),
                 SVector{3,Float64}(0,1,0), SVector{3,Float64}(0,0,1),
