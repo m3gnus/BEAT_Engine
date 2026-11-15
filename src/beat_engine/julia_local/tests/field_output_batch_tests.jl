@@ -2,6 +2,7 @@
 module FieldOutputBatchTests
 
 using Test, StaticArrays, JSON, Base64
+using LinearAlgebra: norm
 
 if isdefined(Main, :CompiledWorkloadBundle)
     const Driver = Main.CompiledWorkloadBundle
@@ -518,6 +519,57 @@ end
             end
         end
     end
+end
+
+# Coupled CPU solves read BLAB_BEAT_CPU_FIELD_KERNEL as exterior-only solves do. The two kernels
+# agree to Float32 rounding (cpu_simd_kernel_tests.jl); everything that is not a field is untouched.
+@testset "coupled CPU field kernel selection (BLAB_BEAT_CPU_FIELD_KERNEL)" begin
+    settings = Driver.coupled_workload_environment(; mumps=false)
+    request = Driver.coupled_workload_request(; tiny=true)
+    request["frequencies_hz"] = [1000.0, 2000.0]
+    second_port = deepcopy(only(request["compiled_system"]["excitation_ports"]))
+    second_port["id"] = "port:second"
+    push!(request["compiled_system"]["excitation_ports"], second_port)
+    push!(request["excitation_port_ids"], second_port["id"])
+    outputs = field_outputs()
+    push!(outputs, field_output("weighted", [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]];
+        options=Dict("excitation_weights" => [Dict("real" => 0.3, "imag" => -0.7),
+                                               Dict("real" => -0.2, "imag" => 0.4)])))
+    request["outputs"] = outputs
+    fields = Set(String(o["id"]) for o in outputs
+                 if o["quantity"] in ("exterior_pressure", "interface_radiated_pressure"))
+    decode(q) = (T = q["values"]["dtype"] == "complex64" ? Float32 : Float64;
+                 ComplexF64.(reinterpret(Complex{T}, base64decode(q["values"]["content_base64"]))))
+    runs = Dict{String,Any}()
+    try
+        for kernel in ("simd", "scalar")
+            withenv(settings..., "BLAB_BEAT_CPU_FIELD_KERNEL" => kernel) do
+                runs[kernel] = Driver.solve_coupled_workload(deepcopy(request))
+            end
+            @test runs[kernel].outcome.solved_count == 2
+            @test all(r["diagnostics"]["cpu_field_kernel"] == kernel for r in runs[kernel].results)
+        end
+        withenv(settings..., "BLAB_BEAT_CPU_FIELD_KERNEL" => "invalid") do
+            @test_throws ErrorException Driver.solve_coupled_workload(deepcopy(request))
+        end
+    finally
+        Driver.reset_compiled_workload_state!()
+    end
+    differs = false
+    for (simd, scalar) in zip(runs["simd"].results, runs["scalar"].results)
+        for (a, b) in zip(simd["quantities"], scalar["quantities"])
+            @test a["id"] == b["id"]
+            if a["id"] in fields
+                x, y = decode(a), decode(b)
+                @test norm(x - y) <= 1e-5 * norm(y)
+                differs |= x != y
+            else
+                check_quantity_bits(a, b)
+            end
+        end
+    end
+    # The scalar setting really evaluates with the other kernel: Float32 fields differ in the last bits.
+    @test differs
 end
 
 end # module

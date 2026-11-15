@@ -182,6 +182,9 @@ if COMPILED_WORKLOAD_PROJECT == "julia_local"
             @test result["freq_hz"] == 1000.0
             @test result["diagnostics"]["formulation"] == "fem_interface_condensed"
             @test result["diagnostics"]["interface_mass_solver"] == "cholmod"
+            # The worker inherits BLAB_BEAT_CPU_FIELD_KERNEL; unset selects the vectorised kernel.
+            @test result["diagnostics"]["cpu_field_kernel"] ==
+                  lowercase(strip(get(ENV, "BLAB_BEAT_CPU_FIELD_KERNEL", "simd")))
             @test length(result["quantities"]) == 4
             @test result["excitation_port_ids"] == ["port:voltage"]
             for quantity in result["quantities"]
