@@ -81,6 +81,21 @@ def test_non_json_or_nonfinite_extension_values_are_rejected(value):
         validate_solve_request(request)
 
 
+@pytest.mark.parametrize("value", [0, 0.0, 0.005, 1])
+def test_wavenumber_shift_accepts_non_negative_numbers(value):
+    request = copy.deepcopy(CORPUS["base_request"])
+    request["solver_options"]["wavenumber_shift"] = value
+    validate_solve_request(request)
+
+
+@pytest.mark.parametrize("value", [-0.001, True, "0.005", None])
+def test_wavenumber_shift_rejects_negative_or_non_numeric(value):
+    request = copy.deepcopy(CORPUS["base_request"])
+    request["solver_options"]["wavenumber_shift"] = value
+    with pytest.raises(ValueError, match="wavenumber_shift"):
+        validate_solve_request(request)
+
+
 def test_contract_loads_standalone_and_validates_without_application_or_numpy():
     code = """
 import importlib.abc

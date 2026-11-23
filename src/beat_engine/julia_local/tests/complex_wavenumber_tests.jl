@@ -173,7 +173,7 @@ cwk_phase_deg(actual, reference) = maximum(abs.(rad2deg.(angle.(actual ./ refere
         end
     end
 
-    if get(ENV, "BEAT_TEST_CUDA", "0") == "1"
+    if get(ENV, "BEAT_TEST_CUDA", "0") == "1" || (isdefined(Main, :cuda_available) && Main.cuda_available())
         @testset "CPU and CUDA damped operators agree" begin
             cuda = CWK.CUDA_MODULE
             @test cuda !== nothing && cuda.functional()
