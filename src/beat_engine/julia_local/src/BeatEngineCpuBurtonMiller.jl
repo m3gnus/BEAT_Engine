@@ -23,6 +23,51 @@
 # Every stage is test-element owned exactly as the four-operator assembly is,
 # so the same colouring keeps the threaded writes race-free.
 
+# Optional complex-wavenumber damping ("complex_k"): with a shift delta > 0 the
+# surface operators use k~ = k + i*alpha, alpha = delta*|k|, so every Green
+# function decays as exp(-alpha r) and resonances inside the boundary are
+# softened (hornlab Metal's `complex_k` formulation). `damping === nothing` is
+# the undamped default; those methods return the original expressions unchanged
+# so the default compiles to the same arithmetic as before.
+@inline _bm_damped_green(green, radius, ::Nothing) = green
+@inline _bm_damped_green(green::Complex{T}, radius::T, alpha::T) where {T<:AbstractFloat} = green * exp(-alpha * radius)
+@inline _bm_grad_factor(inv_radius::T, k::T, ::Nothing) where {T<:AbstractFloat} = Complex{T}(-inv_radius, k)
+@inline _bm_grad_factor(inv_radius::T, k::T, alpha::T) where {T<:AbstractFloat} = Complex{T}(-inv_radius - alpha, k)
+@inline _bm_k_squared(k::T, ::Nothing) where {T<:AbstractFloat} = k * k
+@inline _bm_k_squared(k::T, alpha::T) where {T<:AbstractFloat} = Complex{T}(k * k - alpha * alpha, T(2) * k * alpha)
+
+"""
+    wavenumber_damping(k, wavenumber_shift)
+
+The absolute imaginary wavenumber part alpha = shift*|k| used by the damped
+(complex_k) kernels, or `nothing` for a zero shift so the undamped kernels run.
+"""
+function wavenumber_damping(k::T, wavenumber_shift) where {T<:AbstractFloat}
+    shift = Float64(wavenumber_shift)
+    isfinite(shift) && shift >= 0 || error("wavenumber_shift must be finite and non-negative.")
+    return iszero(shift) ? nothing : T(shift * abs(Float64(k)))
+end
+
+"""
+    exterior_wavenumber_shift(options, supported)
+
+`solver_options.wavenumber_shift` (default 0): the relative imaginary
+wavenumber shift delta of the complex_k exterior operator, k~ = k(1 + i*delta).
+It is implemented by the direct Burton-Miller CPU and CUDA assemblers only;
+any other path refuses a non-zero shift instead of silently ignoring it.
+"""
+function exterior_wavenumber_shift(options, supported::Bool)
+    raw = get(options, "wavenumber_shift", 0)
+    raw isa Real && !(raw isa Bool) || error("wavenumber_shift must be a number.")
+    shift = Float64(raw)
+    isfinite(shift) && shift >= 0 || error("wavenumber_shift must be finite and non-negative.")
+    iszero(shift) || supported || error(
+        "wavenumber_shift is implemented only for the direct_system Burton-Miller assembly on " *
+        "the cpu and cuda backends.",
+    )
+    return shift
+end
+
 @inline function _beat_cpu_bm_scatter!(
     lhs,
     rhs,
@@ -68,11 +113,12 @@ function _beat_cpu_bm_regular_pair_blocks(
     jac_scale::T,
     k::T,
     coupling::Complex{T},
+    damping=nothing,
 ) where {T<:AbstractFloat}
     lhs_block = zero(MMatrix{3,3,Complex{T},9})
     rhs_block = zero(MVector{3,Complex{T}})
     curl_total = zero(Complex{T})
-    k2n = coupling * (k * k * normal_product)
+    k2n = coupling * (_bm_k_squared(k, damping) * normal_product)
 
     @inbounds for test_q in eachindex(test_quad.weights)
         test_basis = test_quad.basis[test_q]
@@ -84,8 +130,8 @@ function _beat_cpu_bm_regular_pair_blocks(
             radius = norm(r_vec)
             radius == zero(T) && continue
             inv_radius = inv(radius)
-            green = _beat_cpu_green(radius, inv_radius, k)
-            grad_scale = green * Complex{T}(-inv_radius, k)
+            green = _bm_damped_green(_beat_cpu_green(radius, inv_radius, k), radius, damping)
+            grad_scale = green * _bm_grad_factor(inv_radius, k, damping)
             weight = test_weight * trial_quad.weights[trial_q] * jac_scale
             weighted_green = green * weight
             lhs_scale = -grad_scale * (dot(r_vec, trial_data.normal) * inv_radius) * weight -
@@ -127,11 +173,12 @@ function _beat_cpu_bm_pair_blocks(
     test_points,
     trial_points,
     weights,
+    damping=nothing,
 ) where {T<:AbstractFloat}
     lhs_block = zero(MMatrix{3,3,Complex{T},9})
     rhs_block = zero(MVector{3,Complex{T}})
     curl_total = zero(Complex{T})
-    k2n = coupling * (k * k * normal_product)
+    k2n = coupling * (_bm_k_squared(k, damping) * normal_product)
 
     @inbounds for q in eachindex(weights)
         test_basis = p1_values(test_points[q])
@@ -142,8 +189,8 @@ function _beat_cpu_bm_pair_blocks(
         radius = norm(r_vec)
         radius == zero(T) && continue
         inv_radius = inv(radius)
-        green = _beat_cpu_green(radius, inv_radius, k)
-        grad_scale = green * Complex{T}(-inv_radius, k)
+        green = _bm_damped_green(_beat_cpu_green(radius, inv_radius, k), radius, damping)
+        grad_scale = green * _bm_grad_factor(inv_radius, k, damping)
         weight = weights[q] * jac_scale
         weighted_green = green * weight
         lhs_scale = -grad_scale * (dot(r_vec, trial_normal) * inv_radius) * weight -
@@ -168,7 +215,7 @@ end
 
 function _beat_cpu_bm_regular_test!(
     lhs, rhs, q_neumann, elements, test_index::Int, trial_indices, k::T,
-    regular_quadrature, coupling::Complex{T},
+    regular_quadrature, coupling::Complex{T}, damping=nothing,
 ) where {T<:AbstractFloat}
     test_data = elements[test_index]
     test_quad = regular_quadrature[test_index]
@@ -178,7 +225,7 @@ function _beat_cpu_bm_regular_test!(
         lhs_block, rhs_block = _beat_cpu_bm_regular_pair_blocks(
             test_data, trial_data, test_quad, regular_quadrature[trial_index],
             dot(test_data.normal, trial_data.normal),
-            T(4.0) * test_data.area * trial_data.area, k, coupling,
+            T(4.0) * test_data.area * trial_data.area, k, coupling, damping,
         )
         _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
@@ -190,7 +237,7 @@ end
 
 function _beat_cpu_bm_regular_image_test!(
     lhs, rhs, q_neumann, elements, image_elements, test_index::Int, trial_indices, k::T,
-    regular_quadrature, image_quadrature, coupling::Complex{T},
+    regular_quadrature, image_quadrature, coupling::Complex{T}, damping=nothing,
 ) where {T<:AbstractFloat}
     test_data = elements[test_index]
     test_quad = regular_quadrature[test_index]
@@ -199,7 +246,7 @@ function _beat_cpu_bm_regular_image_test!(
         lhs_block, rhs_block = _beat_cpu_bm_regular_pair_blocks(
             test_data, trial_data, test_quad, image_quadrature[trial_index],
             dot(test_data.normal, trial_data.normal),
-            T(4.0) * test_data.area * trial_data.area, k, coupling,
+            T(4.0) * test_data.area * trial_data.area, k, coupling, damping,
         )
         _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
@@ -210,7 +257,7 @@ function _beat_cpu_bm_regular_image_test!(
 end
 
 function _beat_cpu_bm_singular_test!(
-    lhs, rhs, q_neumann, elements, pairs, rules, k::T, coupling::Complex{T},
+    lhs, rhs, q_neumann, elements, pairs, rules, k::T, coupling::Complex{T}, damping=nothing,
 ) where {T<:AbstractFloat}
     for pair in pairs
         test_data = elements[pair.test_index]
@@ -219,7 +266,7 @@ function _beat_cpu_bm_singular_test!(
         lhs_block, rhs_block = _beat_cpu_bm_pair_blocks(
             test_data.vertices, trial_data.vertices, test_data.normal, trial_data.normal,
             test_data.curls, trial_data.curls, pair.normal_product, pair.jac_scale, k, coupling,
-            duffy.test_points, duffy.trial_points, duffy.weights,
+            duffy.test_points, duffy.trial_points, duffy.weights, damping,
         )
         _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
@@ -236,7 +283,7 @@ end
 # runs the symmetry fixtures.
 function _beat_cpu_bm_image_singular_delta_test!(
     lhs, rhs, q_neumann, elements, image_elements, pairs, rules, k::T,
-    regular_quadrature, image_quadrature, coupling::Complex{T},
+    regular_quadrature, image_quadrature, coupling::Complex{T}, damping=nothing,
 ) where {T<:AbstractFloat}
     for pair in pairs
         test_data = elements[pair.test_index]
@@ -245,7 +292,7 @@ function _beat_cpu_bm_image_singular_delta_test!(
         lhs_block, rhs_block = _beat_cpu_bm_pair_blocks(
             test_data.vertices, trial_data.vertices, test_data.normal, trial_data.normal,
             test_data.curls, trial_data.curls, pair.normal_product, pair.jac_scale, k, coupling,
-            duffy.test_points, duffy.trial_points, duffy.weights,
+            duffy.test_points, duffy.trial_points, duffy.weights, damping,
         )
         _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
@@ -254,7 +301,7 @@ function _beat_cpu_bm_image_singular_delta_test!(
         regular_lhs, regular_rhs = _beat_cpu_bm_regular_pair_blocks(
             test_data, trial_data, regular_quadrature[pair.test_index],
             image_quadrature[pair.trial_index], pair.normal_product,
-            T(4.0) * test_data.area * trial_data.area, k, coupling,
+            T(4.0) * test_data.area * trial_data.area, k, coupling, damping,
         )
         _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
@@ -292,9 +339,17 @@ function assemble_burton_miller_neumann_system_cpu(
     symmetry_mode::Symbol=:off,
     regular_kernel::Symbol=:scalar,
     singular_kernel::Symbol=:scalar,
+    wavenumber_shift=0,
 ) where {T<:AbstractFloat}
     regular_kernel = _beat_cpu_validated_regular_kernel(regular_kernel)
     singular_kernel = _beat_cpu_validated_regular_kernel(singular_kernel)
+    damping = wavenumber_damping(k, wavenumber_shift)
+    if damping !== nothing
+        # The SIMD kernels evaluate the undamped Green function only; the damped
+        # operator runs on the scalar kernels.
+        regular_kernel = :scalar
+        singular_kernel = :scalar
+    end
     k = outgoing_wavenumber(k)
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
     if cpu_cache !== nothing
@@ -333,7 +388,7 @@ function assemble_burton_miller_neumann_system_cpu(
                 Threads.@threads for group_index in eachindex(group)
                     _beat_cpu_bm_regular_test!(
                         lhs, rhs, q_complex, elements, group[group_index], indices, k,
-                        regular_quadrature, coupling,
+                        regular_quadrature, coupling, damping,
                     )
                 end
             end
@@ -341,7 +396,7 @@ function assemble_burton_miller_neumann_system_cpu(
             for test_index in indices
                 _beat_cpu_bm_regular_test!(
                     lhs, rhs, q_complex, elements, test_index, indices, k,
-                    regular_quadrature, coupling,
+                    regular_quadrature, coupling, damping,
                 )
             end
         end
@@ -357,7 +412,7 @@ function assemble_burton_miller_neumann_system_cpu(
                     Threads.@threads for group_index in eachindex(group)
                         _beat_cpu_bm_regular_image_test!(
                             lhs, rhs, q_complex, elements, image_elements, group[group_index],
-                            indices, k, regular_quadrature, image_quadrature, coupling,
+                            indices, k, regular_quadrature, image_quadrature, coupling, damping,
                         )
                     end
                 end
@@ -365,7 +420,7 @@ function assemble_burton_miller_neumann_system_cpu(
                 for test_index in indices
                     _beat_cpu_bm_regular_image_test!(
                         lhs, rhs, q_complex, elements, image_elements, test_index,
-                        indices, k, regular_quadrature, image_quadrature, coupling,
+                        indices, k, regular_quadrature, image_quadrature, coupling, damping,
                     )
                 end
             end
@@ -383,7 +438,7 @@ function assemble_burton_miller_neumann_system_cpu(
                     Threads.@threads for group_index in eachindex(group)
                         _beat_cpu_bm_singular_test!(
                             lhs, rhs, q_complex, elements,
-                            cache.pairs_by_test[group[group_index]], singular_rules, k, coupling,
+                            cache.pairs_by_test[group[group_index]], singular_rules, k, coupling, damping,
                         )
                     end
                 end
@@ -391,7 +446,7 @@ function assemble_burton_miller_neumann_system_cpu(
                 for test_index in indices
                     _beat_cpu_bm_singular_test!(
                         lhs, rhs, q_complex, elements,
-                        cache.pairs_by_test[test_index], singular_rules, k, coupling,
+                        cache.pairs_by_test[test_index], singular_rules, k, coupling, damping,
                     )
                 end
             end
@@ -422,7 +477,7 @@ function assemble_burton_miller_neumann_system_cpu(
                             _beat_cpu_bm_image_singular_delta_test!(
                                 lhs, rhs, q_complex, elements, image_elements,
                                 image_cache.pairs_by_test[group[group_index]], image_rules,
-                                k, regular_quadrature, image_quadrature, coupling,
+                                k, regular_quadrature, image_quadrature, coupling, damping,
                             )
                         end
                     end
@@ -431,7 +486,7 @@ function assemble_burton_miller_neumann_system_cpu(
                         _beat_cpu_bm_image_singular_delta_test!(
                             lhs, rhs, q_complex, elements, image_elements,
                             image_cache.pairs_by_test[test_index], image_rules,
-                            k, regular_quadrature, image_quadrature, coupling,
+                            k, regular_quadrature, image_quadrature, coupling, damping,
                         )
                     end
                 end

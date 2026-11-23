@@ -163,6 +163,18 @@ def _impedance_outputs(request: dict) -> None:
                 "request.solver_options.transducer_reference_voltage_v",
                 "transducer_reference_voltage_v must be finite and positive",
             )
+    if "wavenumber_shift" in options:
+        shift = options["wavenumber_shift"]
+        if (
+            isinstance(shift, bool)
+            or not isinstance(shift, (int, float))
+            or not math.isfinite(shift)
+            or shift < 0
+        ):
+            _fail(
+                "request.solver_options.wavenumber_shift",
+                "wavenumber_shift must be finite and non-negative",
+            )
     if exterior_transducers:
         if (
             str(options.get("bem_backend", "cpu")).lower() == "metal"

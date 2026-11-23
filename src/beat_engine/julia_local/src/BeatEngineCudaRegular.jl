@@ -53,7 +53,11 @@ function _cuda_regular_kernel!(
     rhs_re,
     rhs_im,
     q_neumann,
+    damping=nothing,
 )
+    # `damping` is nothing (real k) or alpha = shift*|k|: the complex_k operator
+    # with k~ = k + i*alpha. The `damping !== nothing` blocks are removed at
+    # compile time for nothing, so the undamped kernel is unchanged.
     pair = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     stride = blockDim().x * gridDim().x
     four_pi = typeof(k)(12.566370614359172)
@@ -210,6 +214,11 @@ function _cuda_regular_kernel!(
                         green_scale = inv_radius / four_pi
                         green_re = cos(phase) * green_scale
                         green_im = sin(phase) * green_scale
+                        if damping !== nothing
+                            decay = exp(-damping * radius)
+                            green_re *= decay
+                            green_im *= decay
+                        end
                         weight = tw * rw * jac_scale
                         weighted_re = green_re * weight
                         weighted_im = green_im * weight
@@ -217,6 +226,9 @@ function _cuda_regular_kernel!(
                         source_projection = (dx * rnx + dy * rny + dz * rnz) * inv_radius
                         test_projection = -(dx * tnx + dy * tny + dz * tnz) * inv_radius
                         factor_re = -inv_radius
+                        if damping !== nothing
+                            factor_re -= damping
+                        end
                         factor_im = k
                         deriv_re = green_re * factor_re - green_im * factor_im
                         deriv_im = green_re * factor_im + green_im * factor_re
@@ -287,6 +299,21 @@ function _cuda_regular_kernel!(
                         hyp31_im += h31 * weighted_im
                         hyp32_im += h32 * weighted_im
                         hyp33_im += h33 * weighted_im
+                        if damping !== nothing
+                            # k~^2 = k^2 - alpha^2 + 2i k alpha; add the change
+                            # (alpha^2 - 2i k alpha)(n.n') phi_i phi_j G.
+                            extra_re = normal_product * (damping * damping * weighted_re + 2 * k * damping * weighted_im)
+                            extra_im = normal_product * (damping * damping * weighted_im - 2 * k * damping * weighted_re)
+                            hyp11_re += tv1 * rv1 * extra_re; hyp11_im += tv1 * rv1 * extra_im
+                            hyp12_re += tv1 * rv2 * extra_re; hyp12_im += tv1 * rv2 * extra_im
+                            hyp13_re += tv1 * rv3 * extra_re; hyp13_im += tv1 * rv3 * extra_im
+                            hyp21_re += tv2 * rv1 * extra_re; hyp21_im += tv2 * rv1 * extra_im
+                            hyp22_re += tv2 * rv2 * extra_re; hyp22_im += tv2 * rv2 * extra_im
+                            hyp23_re += tv2 * rv3 * extra_re; hyp23_im += tv2 * rv3 * extra_im
+                            hyp31_re += tv3 * rv1 * extra_re; hyp31_im += tv3 * rv1 * extra_im
+                            hyp32_re += tv3 * rv2 * extra_re; hyp32_im += tv3 * rv2 * extra_im
+                            hyp33_re += tv3 * rv3 * extra_re; hyp33_im += tv3 * rv3 * extra_im
+                        end
                         end
                     end
                 end
