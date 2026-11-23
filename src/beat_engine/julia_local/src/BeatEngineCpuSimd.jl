@@ -683,7 +683,9 @@ function _beat_cpu_bm_pair_blocks(
     test_points::BeatCpuDuffyCoords{T},
     trial_points::BeatCpuDuffyCoords{T},
     w::Vector{T},
+    ::Nothing=nothing,
 ) where {T<:AbstractFloat}
+    # Undamped only: a non-zero wavenumber_shift selects the scalar kernels.
     cr, ci = reim(coupling)
     k2n = coupling * (k * k * normal_product)
     knr, kni = reim(k2n)

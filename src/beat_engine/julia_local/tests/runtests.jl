@@ -107,6 +107,7 @@ include(joinpath(@__DIR__, "coupled_condensed_tests.jl"))
 include(joinpath(@__DIR__, "cpu_simd_kernel_tests.jl"))
 include(joinpath(@__DIR__, "cpu_refinement_tests.jl"))
 include(joinpath(@__DIR__, "phasor_tests.jl"))
+include(joinpath(@__DIR__, "complex_wavenumber_tests.jl"))
 include(joinpath(@__DIR__, "axial_source_tests.jl"))
 
 @testset "cpu BLAS thread policy" begin

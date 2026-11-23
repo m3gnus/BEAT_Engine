@@ -376,7 +376,10 @@ function _cuda_duffy_blocks_kernel!(
     k,
     face_count,
     pair_count,
+    damping=nothing,
 )
+    # `damping`: nothing (real k) or alpha = shift*|k| for k~ = k + i*alpha; the
+    # `damping !== nothing` blocks compile away for nothing.
     pair_index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     stride = blockDim().x * gridDim().x
     T = typeof(k)
@@ -496,6 +499,12 @@ function _cuda_duffy_blocks_kernel!(
                 single_re = cos(phase) * green_scale
                 single_im = sin(phase) * green_scale
                 grad_scale_re = -inv(radius)
+                if damping !== nothing
+                    decay = exp(-damping * radius)
+                    single_re *= decay
+                    single_im *= decay
+                    grad_scale_re -= damping
+                end
                 grad_scale_im = k
                 grad_re = single_re * grad_scale_re - single_im * grad_scale_im
                 grad_im = single_re * grad_scale_im + single_im * grad_scale_re
@@ -551,6 +560,20 @@ function _cuda_duffy_blocks_kernel!(
                 hyp_re_13 += c13 * single_re; hyp_im_13 += c13 * single_im
                 hyp_re_23 += c23 * single_re; hyp_im_23 += c23 * single_im
                 hyp_re_33 += c33 * single_re; hyp_im_33 += c33 * single_im
+                if damping !== nothing
+                    # k~^2 = k^2 - alpha^2 + 2i k alpha: the change (alpha^2 - 2i k alpha)(n.n') phi phi G.
+                    extra_re = normal_product * (damping * damping * single_re + 2 * k * damping * single_im)
+                    extra_im = normal_product * (damping * damping * single_im - 2 * k * damping * single_re)
+                    hyp_re_11 += tb1 * rb1 * extra_re; hyp_im_11 += tb1 * rb1 * extra_im
+                    hyp_re_12 += tb1 * rb2 * extra_re; hyp_im_12 += tb1 * rb2 * extra_im
+                    hyp_re_13 += tb1 * rb3 * extra_re; hyp_im_13 += tb1 * rb3 * extra_im
+                    hyp_re_21 += tb2 * rb1 * extra_re; hyp_im_21 += tb2 * rb1 * extra_im
+                    hyp_re_22 += tb2 * rb2 * extra_re; hyp_im_22 += tb2 * rb2 * extra_im
+                    hyp_re_23 += tb2 * rb3 * extra_re; hyp_im_23 += tb2 * rb3 * extra_im
+                    hyp_re_31 += tb3 * rb1 * extra_re; hyp_im_31 += tb3 * rb1 * extra_im
+                    hyp_re_32 += tb3 * rb2 * extra_re; hyp_im_32 += tb3 * rb2 * extra_im
+                    hyp_re_33 += tb3 * rb3 * extra_re; hyp_im_33 += tb3 * rb3 * extra_im
+                end
             end
         end
 
@@ -612,6 +635,7 @@ function _cuda_image_singular_delta_blocks_kernel!(
     face_count,
     regular_rule_count,
     pair_count,
+    damping=nothing,
 )
     pair_index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     stride = blockDim().x * gridDim().x
@@ -733,6 +757,12 @@ function _cuda_image_singular_delta_blocks_kernel!(
                 single_re = cos(phase) / (four_pi * radius)
                 single_im = sin(phase) / (four_pi * radius)
                 grad_scale_re = -inv(radius)
+                if damping !== nothing
+                    decay = exp(-damping * radius)
+                    single_re *= decay
+                    single_im *= decay
+                    grad_scale_re -= damping
+                end
                 grad_scale_im = k
                 grad_re = single_re * grad_scale_re - single_im * grad_scale_im
                 grad_im = single_re * grad_scale_im + single_im * grad_scale_re
@@ -781,6 +811,20 @@ function _cuda_image_singular_delta_blocks_kernel!(
                 hyp_re_13 += c13 * single_re; hyp_im_13 += c13 * single_im
                 hyp_re_23 += c23 * single_re; hyp_im_23 += c23 * single_im
                 hyp_re_33 += c33 * single_re; hyp_im_33 += c33 * single_im
+                if damping !== nothing
+                    # k~^2 = k^2 - alpha^2 + 2i k alpha: the change (alpha^2 - 2i k alpha)(n.n') phi phi G.
+                    extra_re = normal_product * (damping * damping * single_re + 2 * k * damping * single_im)
+                    extra_im = normal_product * (damping * damping * single_im - 2 * k * damping * single_re)
+                    hyp_re_11 += tb1 * rb1 * extra_re; hyp_im_11 += tb1 * rb1 * extra_im
+                    hyp_re_12 += tb1 * rb2 * extra_re; hyp_im_12 += tb1 * rb2 * extra_im
+                    hyp_re_13 += tb1 * rb3 * extra_re; hyp_im_13 += tb1 * rb3 * extra_im
+                    hyp_re_21 += tb2 * rb1 * extra_re; hyp_im_21 += tb2 * rb1 * extra_im
+                    hyp_re_22 += tb2 * rb2 * extra_re; hyp_im_22 += tb2 * rb2 * extra_im
+                    hyp_re_23 += tb2 * rb3 * extra_re; hyp_im_23 += tb2 * rb3 * extra_im
+                    hyp_re_31 += tb3 * rb1 * extra_re; hyp_im_31 += tb3 * rb1 * extra_im
+                    hyp_re_32 += tb3 * rb2 * extra_re; hyp_im_32 += tb3 * rb2 * extra_im
+                    hyp_re_33 += tb3 * rb3 * extra_re; hyp_im_33 += tb3 * rb3 * extra_im
+                end
             end
         end
 
@@ -814,6 +858,12 @@ function _cuda_image_singular_delta_blocks_kernel!(
                     single_re = cos(phase) / (four_pi * radius)
                     single_im = sin(phase) / (four_pi * radius)
                     grad_scale_re = -inv(radius)
+                    if damping !== nothing
+                        decay = exp(-damping * radius)
+                        single_re *= decay
+                        single_im *= decay
+                        grad_scale_re -= damping
+                    end
                     grad_scale_im = k
                     grad_re = single_re * grad_scale_re - single_im * grad_scale_im
                     grad_im = single_re * grad_scale_im + single_im * grad_scale_re
@@ -862,6 +912,20 @@ function _cuda_image_singular_delta_blocks_kernel!(
                     hyp_re_13 -= c13 * single_re; hyp_im_13 -= c13 * single_im
                     hyp_re_23 -= c23 * single_re; hyp_im_23 -= c23 * single_im
                     hyp_re_33 -= c33 * single_re; hyp_im_33 -= c33 * single_im
+                    if damping !== nothing
+                        # k~^2 = k^2 - alpha^2 + 2i k alpha: the change (alpha^2 - 2i k alpha)(n.n') phi phi G.
+                        extra_re = normal_product * (damping * damping * single_re + 2 * k * damping * single_im)
+                        extra_im = normal_product * (damping * damping * single_im - 2 * k * damping * single_re)
+                        hyp_re_11 -= tb1 * rb1 * extra_re; hyp_im_11 -= tb1 * rb1 * extra_im
+                        hyp_re_12 -= tb1 * rb2 * extra_re; hyp_im_12 -= tb1 * rb2 * extra_im
+                        hyp_re_13 -= tb1 * rb3 * extra_re; hyp_im_13 -= tb1 * rb3 * extra_im
+                        hyp_re_21 -= tb2 * rb1 * extra_re; hyp_im_21 -= tb2 * rb1 * extra_im
+                        hyp_re_22 -= tb2 * rb2 * extra_re; hyp_im_22 -= tb2 * rb2 * extra_im
+                        hyp_re_23 -= tb2 * rb3 * extra_re; hyp_im_23 -= tb2 * rb3 * extra_im
+                        hyp_re_31 -= tb3 * rb1 * extra_re; hyp_im_31 -= tb3 * rb1 * extra_im
+                        hyp_re_32 -= tb3 * rb2 * extra_re; hyp_im_32 -= tb3 * rb2 * extra_im
+                        hyp_re_33 -= tb3 * rb3 * extra_re; hyp_im_33 -= tb3 * rb3 * extra_im
+                    end
                 end
             end
         end

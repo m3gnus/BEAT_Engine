@@ -1084,6 +1084,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     direct_metal_assembly = backend == :metal && requested_assembly == "direct_system" &&
         metal_direct_assembly_available()
     assembly_mode = direct_cpu_assembly || direct_cuda_assembly || direct_metal_assembly ? "direct_system" : "operator_matrices"
+    # Optional complex-wavenumber damping (hornlab Metal's `complex_k`): the
+    # surface operators use k(1 + i*shift); the observation field keeps real k.
+    wavenumber_shift = BeatEngineCore.exterior_wavenumber_shift(options, direct_cpu_assembly || direct_cuda_assembly)
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(get(options, "symmetry", "off"))
     sound_speed = FloatType(unbounded_region["sound_speed_m_per_s"])
     density = FloatType(unbounded_region["density_kg_per_m3"])
@@ -1329,6 +1332,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     singular_order=singular_order, singular_cache=singular_cache,
                     cpu_cache=selected_cpu_cache, symmetry_mode=symmetry_mode,
                     regular_kernel=cpu_regular_kernel, singular_kernel=cpu_singular_kernel,
+                    wavenumber_shift=wavenumber_shift,
                 )
                 assembly_s = (time_ns() - assembly_started) / 1.0e9
                 solve_started = time_ns()
@@ -1345,6 +1349,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
                     symmetry_mode=symmetry_mode,
+                    wavenumber_shift=wavenumber_shift,
                 )
             elseif direct_metal_assembly && metal_pipeline
                 produced = take_sweep_assembly!(assembly_pipeline, frequency_index)
@@ -2297,6 +2302,7 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
     components = system["components"]
     ports = system["excitation_ports"]
     solver_options = get(request, "solver_options", Dict{String,Any}())
+    BeatEngineCore.exterior_wavenumber_shift(solver_options, false)
     precision_name = lowercase(String(get(solver_options, "precision", "float64")))
     FloatType = if precision_name in ("float32", "complex64")
         Float32
@@ -2802,6 +2808,7 @@ function solve_request_impl(request; event_mode=false)
     end
 
     solver_options = get(request, "solver_options", Dict{String,Any}())
+    BeatEngineCore.exterior_wavenumber_shift(solver_options, false)
     precision_name = lowercase(String(get(solver_options, "precision", "float64")))
     FloatType = if precision_name in ("float32", "complex64")
         Float32
