@@ -180,7 +180,8 @@ cwk_phase_deg(actual, reference) = maximum(abs.(rad2deg.(angle.(actual ./ refere
             T = Float32
             shift = 0.005
             for symmetry in (:off, :xy)
-                m = symmetry == :off ? mesh : cwk_sphere(radius, 4; quadrant=true)
+                m64 = symmetry == :off ? mesh : cwk_sphere(radius, 4; quadrant=true)
+                m = BoundaryMesh([SVector{3,T}(v) for v in m64.vertices], m64.faces, m64.physical_tags)
                 q = Complex{T}[cis(0.37 * i) for i in eachindex(m.faces)]
                 p1, dp0 = build_p1_space(m), build_dp0_space(m)
                 rule = triangle_rule(T, 4)
