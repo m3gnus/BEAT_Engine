@@ -67,6 +67,10 @@ near-pair selection remains CPU-only; this extension serves callers, such as
 Deploy, that supply explicit correction caches. Diagnostics identify CPU near
 corrections and the host dense solver separately from the Metal field backend.
 
+Electrically large panels are corrected per frequency, partly on the device and
+partly on the host; see [Large Panels](Large%20Panels.md) and
+`tests/metal_large_panel_tests.jl`.
+
 Run `tests/metal_near_correction_tests.jl` under the Metal Julia project for the
 hardware gate: CPU operator agreement for direct and ground-image corrections,
 both phasor conventions, both storage modes, and two quadrature rules. Hardware

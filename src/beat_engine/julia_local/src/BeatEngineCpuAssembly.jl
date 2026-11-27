@@ -753,10 +753,15 @@ function assemble_regular_galerkin_operators_cpu(
     image_near_correction_cache=nothing,
     symmetry_mode::Symbol=:off,
     regular_kernel::Symbol=:scalar,
+    large_panels=nothing,
 ) where {T<:AbstractFloat}
     regular_kernel = _beat_cpu_validated_regular_kernel(regular_kernel)
     k = outgoing_wavenumber(k)
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
+    large_panels === nothing || !skip_singular || error("Large-panel integration corrects the singular pass; it cannot skip it.")
+    _large_panel_require_singular_order(large_panels, singular_order)
+    large_panels === nothing || (near_correction_cache === nothing && image_near_correction_cache === nothing) ||
+        error("Large-panel integration and near corrections would both replace the regular rule on the same pairs.")
 
     if cpu_cache !== nothing
         cpu_cache.symmetry_mode == symmetry_mode || error("CPU assembly cache symmetry mode does not match the requested mode.")
@@ -997,6 +1002,28 @@ function assemble_regular_galerkin_operators_cpu(
         end
     end
     timing !== nothing && (timing["near_pair_corrections_cpu_scatter"] = near_elapsed)
+
+    if large_panels !== nothing
+        panel_elapsed = @elapsed _beat_cpu_apply_large_panels!(
+            (
+                single_layer=single_layer,
+                double_layer=double_layer,
+                adjoint_double_layer=adjoint_double_layer,
+                hypersingular=hypersingular,
+            ),
+            mesh,
+            large_panels,
+            elements,
+            regular_quadrature,
+            singular_cache === nothing ? build_singular_correction_cache(mesh, singular_order, indices) : singular_cache,
+            indices,
+            color_groups,
+            threaded_enabled,
+            image_transforms,
+            k,
+        )
+        timing !== nothing && (timing["large_panel_corrections_cpu"] = panel_elapsed)
+    end
 
     _beat_cpu_apply_operator_p1_row_weights!(
         (

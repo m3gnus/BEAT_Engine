@@ -1005,6 +1005,15 @@ function solve_request_impl(request)
     identity_cache = Dict{Int,Any}(base_regular_order => (identity_p1_p1, identity_p1_dp0))
     cpu_field_cache_by_order = Dict{Int,Any}(base_regular_order => cpu_field_cache)
     cpu_assembly_cache_by_order = Dict{Int,Any}()
+    # Near corrections replace the regular rule pair by pair, so a large-panel
+    # correction on top of them would count those pairs twice.
+    # Every path reports large panels; only CPU and Metal without near
+    # corrections integrate them.
+    large_panel_mesh_rules = LargePanelRules(mesh, singular_order)
+    large_panel_unapplied = !(beat_backend in (:cpu, :metal)) ? LARGE_PANEL_UNSUPPORTED_BACKEND :
+                            near_enabled ? LARGE_PANEL_NEAR_CORRECTION : ""
+    large_panel_rules = isempty(large_panel_unapplied) ? large_panel_mesh_rules : nothing
+    large_panel_warned = false
     if beat_backend == :cuda
         emit_event("status"; message="Initializing BEAT Engine using CUDA...")
         device_cache = build_cuda_regular_assembly_cache(mesh, rule)
@@ -1114,6 +1123,7 @@ function solve_request_impl(request)
                 identity_cache=metal_fused_identity_cache,
                 singular_order=singular_order,
                 symmetry_mode=Symbol(symmetry_mode),
+                large_panels=large_panel_plan(large_panel_rules, k_value),
             )
             return (
                 payload=(kind=:fused, system=system, q_columns=q_columns),
@@ -1139,6 +1149,7 @@ function solve_request_impl(request)
             device_singular_cache=device_singular_cache,
             metal_assembly_mode=metal_assembly_mode,
             symmetry_mode=Symbol(symmetry_mode),
+            large_panels=large_panel_plan(large_panel_rules, k_value),
         )
         return (
             payload=(kind=:operators, operators=assembled),
@@ -1153,6 +1164,8 @@ function solve_request_impl(request)
     # here so the outer `finally` can free its device buffers when the solve,
     # field evaluation, synthesis, or diagnostics throw.
     current_assembly_payload = nothing
+    # This frequency's large-panel field sources on Metal, freed the same way.
+    current_panel_field_cache = nothing
     if metal_pipeline && !isempty(frequencies)
         assembly_lookahead = metal_sweep_assembly_lookahead(
             p1_space.global_dof_count,
@@ -1198,6 +1211,13 @@ function solve_request_impl(request)
         selected_device_cache = device_cache
         selected_rocm_identity_cache = rocm_solve_identity_cache
         selected_cpu_assembly_cache = nothing
+        large_panels = large_panel_plan(large_panel_rules, k)
+        large_panel_status = large_panel_report(large_panel_mesh_rules, k, large_panels, large_panel_unapplied)
+        large_panel_message = large_panel_warning(large_panel_status, freq)
+        if large_panel_message !== nothing && !large_panel_warned
+            emit_event("status"; message=large_panel_message, level="warning")
+            large_panel_warned = true
+        end
         if beat_backend == :rocm && quadrature_selection.order != base_regular_order
             selected_cache = get!(rocm_quadrature_caches, quadrature_selection.order) do
                 BeatEngineCore.build_rocm_quadrature_cache(mesh, p1_space, dp0_space, selected_rule;
@@ -1231,6 +1251,12 @@ function solve_request_impl(request)
             end
         end
 
+        if large_panels !== nothing
+            planned_field_cache = build_field_evaluation_cache(mesh, selected_rule; symmetry_mode=Symbol(symmetry_mode), large_panels=large_panels)
+            selected_field_cache = beat_backend == :metal ?
+                (current_panel_field_cache = build_metal_field_evaluation_cache(planned_field_cache)) : planned_field_cache
+        end
+
         pipelined_assembly_seconds = 0.0
         t_assembly = @elapsed begin
             if metal_pipeline
@@ -1260,6 +1286,7 @@ function solve_request_impl(request)
                         identity_cache=metal_fused_identity_cache,
                         singular_order=singular_order,
                         symmetry_mode=Symbol(symmetry_mode),
+                        large_panels=large_panels,
                     ) :
                     assemble_burton_miller_neumann_system_cpu(
                         mesh, p1_space, dp0_space, fused_q_columns, k, selected_rule;
@@ -1272,6 +1299,7 @@ function solve_request_impl(request)
                         symmetry_mode=Symbol(symmetry_mode),
                         regular_kernel=cpu_regular_kernel,
                         singular_kernel=BeatEngineCore.beat_cpu_singular_kernel(),
+                        large_panels=large_panels,
                     )
                 assembly_payload = (kind=:fused, system=fused_system, q_columns=fused_q_columns)
             else
@@ -1297,6 +1325,7 @@ function solve_request_impl(request)
                     metal_assembly_mode=metal_assembly_mode,
                     symmetry_mode=Symbol(symmetry_mode),
                     cpu_regular_kernel=cpu_regular_kernel,
+                    large_panels=large_panels,
                 ))
             end
         end
@@ -1419,6 +1448,10 @@ function solve_request_impl(request)
 
         release_assembly_payload!(assembly_payload)
         current_assembly_payload = nothing
+        if current_panel_field_cache !== nothing
+            release_metal_field_evaluation_cache!(current_panel_field_cache)
+            current_panel_field_cache = nothing
+        end
         emit_event(
             "result";
             solved_count=index,
@@ -1494,6 +1527,7 @@ function solve_request_impl(request)
                     "p1_dof_count" => p1_space.global_dof_count,
                     "regular_quadrature_mode" => regular_quadrature_mode,
                     "regular_quadrature_order" => quadrature_selection.order,
+                    large_panel_diagnostics(large_panel_status)...,
                     "cpu_regular_kernel" => beat_backend == :cpu ? String(cpu_regular_kernel) : nothing,
                     "cpu_singular_kernel" => assembly_payload.kind === :fused && beat_backend == :cpu ?
                         String(assembly_payload.system.singular_kernel) : nothing,
@@ -1517,6 +1551,7 @@ function solve_request_impl(request)
             end
         end
         shutdown_sweep_assembly_pipeline!(assembly_pipeline, release_produced_assembly!)
+        current_panel_field_cache === nothing || release_metal_field_evaluation_cache!(current_panel_field_cache)
         if cuda_solve_identity_cache !== nothing
             release_cuda_burton_miller_identity_cache!(cuda_solve_identity_cache)
         end

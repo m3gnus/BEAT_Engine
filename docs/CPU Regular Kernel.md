@@ -24,6 +24,9 @@ directivity. `"wavelength"` is now an explicit CPU opt-in and is unsafe on grade
 meshes; its existing statistics and cutoffs are unchanged. Coupled condensed
 solves already default to fixed mode and keep their existing base-order defaults.
 
+Panels too large electrically for the base rule get their own: see
+[Large Panels](Large%20Panels.md).
+
 ## What it changes, and what it cannot
 
 Only the CPU source-request driver (`BeatEngineDriver.jl`) selects it, for both

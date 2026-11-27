@@ -28,26 +28,38 @@
         @inbounds test_weight = rule_weights[test_q]
         trial_context = (p[1].value, p[2].value, p[3].value, test_weight * jac_scale, k, inv_four_pi,
             test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs, points4, trial_index)
-        s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = _metal_packed_trial_fold(
+        folded = _metal_packed_trial_fold(
             (zero(k), zero(k), zero(k), zero(k), z3, z3, z3, z3), trial_context, Val(R), rc, rv)
-        rhs_re += test_basis * (-s_re + inverse_k * a_im)
-        rhs_im += test_basis * (-s_im - inverse_k * a_re)
-        g_total_re += s_re
-        g_total_im += s_im
-        u_re = -d_re + curl_scale * h_im
-        u_im = -d_im - curl_scale * h_re
-        lhs_re += SVector(
-            tb1 * u_re[1], tb2 * u_re[1], tb3 * u_re[1],
-            tb1 * u_re[2], tb2 * u_re[2], tb3 * u_re[2],
-            tb1 * u_re[3], tb2 * u_re[3], tb3 * u_re[3],
-        )
-        lhs_im += SVector(
-            tb1 * u_im[1], tb2 * u_im[1], tb3 * u_im[1],
-            tb1 * u_im[2], tb2 * u_im[2], tb3 * u_im[2],
-            tb1 * u_im[3], tb2 * u_im[3], tb3 * u_im[3],
-        )
+        lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im = _metal_fused_test_point_update(
+            (lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im), folded, test_basis, inverse_k, curl_scale)
         test_q += Int32(1)
     end
+    return (lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im)
+end
+
+# Fold one test point's trial sum into the Burton-Miller blocks.
+@inline function _metal_fused_test_point_update(acc, folded, test_basis, inverse_k, curl_scale)
+    lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im = acc
+    s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = folded
+    tb1 = test_basis[1]
+    tb2 = test_basis[2]
+    tb3 = test_basis[3]
+    rhs_re += test_basis * (-s_re + inverse_k * a_im)
+    rhs_im += test_basis * (-s_im - inverse_k * a_re)
+    g_total_re += s_re
+    g_total_im += s_im
+    u_re = -d_re + curl_scale * h_im
+    u_im = -d_im - curl_scale * h_re
+    lhs_re += SVector(
+        tb1 * u_re[1], tb2 * u_re[1], tb3 * u_re[1],
+        tb1 * u_re[2], tb2 * u_re[2], tb3 * u_re[2],
+        tb1 * u_re[3], tb2 * u_re[3], tb3 * u_re[3],
+    )
+    lhs_im += SVector(
+        tb1 * u_im[1], tb2 * u_im[1], tb3 * u_im[1],
+        tb1 * u_im[2], tb2 * u_im[2], tb3 * u_im[2],
+        tb1 * u_im[3], tb2 * u_im[3], tb3 * u_im[3],
+    )
     return (lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im)
 end
 

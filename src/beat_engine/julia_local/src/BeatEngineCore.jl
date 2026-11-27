@@ -104,6 +104,14 @@ export BoundaryMesh,
     build_beat_cpu_assembly_cache,
     build_singular_correction_cache,
     build_near_correction_cache,
+    LargePanelRules,
+    large_panel_plan,
+    large_panel_summary,
+    large_panel_report,
+    large_panel_diagnostics,
+    large_panel_warning,
+    LARGE_PANEL_UNSUPPORTED_BACKEND,
+    LARGE_PANEL_NEAR_CORRECTION,
     assemble_regular_galerkin_operators_cpu,
     assemble_regular_galerkin_operators_cuda_regular,
     assemble_regular_galerkin_operators_rocm_regular,
@@ -692,19 +700,24 @@ function triangle_rule(::Type{T}, order::Int=2) where {T<:AbstractFloat}
 end
 
 """Conical tensor-product Gauss rule for demanding regular triangle integrals."""
-function tensor_triangle_rule(::Type{T}, order::Int) where {T<:AbstractFloat}
+tensor_triangle_rule(::Type{T}, order::Int) where {T<:AbstractFloat} = collapsed_triangle_rule(T, order, _ -> order)
+
+"""
+Conical Gauss rule with `order` lines of constant u and `line_order(1 - u)`
+points on each line.
+"""
+function collapsed_triangle_rule(::Type{T}, order::Int, line_order) where {T<:AbstractFloat}
     order > 0 || error("Tensor triangle quadrature order must be positive.")
     nodes, weights = gauss_rule_1d(T, order)
     points = SVector{2,T}[]
     triangle_weights = T[]
-    sizehint!(points, order * order)
-    sizehint!(triangle_weights, order * order)
     for i in eachindex(nodes)
         u = nodes[i]
         jacobian = one(T) - u
-        for j in eachindex(nodes)
-            push!(points, SVector{2,T}(u, jacobian * nodes[j]))
-            push!(triangle_weights, weights[i] * weights[j] * jacobian)
+        line_nodes, line_weights = gauss_rule_1d(T, line_order(jacobian))
+        for j in eachindex(line_nodes)
+            push!(points, SVector{2,T}(u, jacobian * line_nodes[j]))
+            push!(triangle_weights, weights[i] * line_weights[j] * jacobian)
         end
     end
     return TriangleRule(points, triangle_weights)
@@ -1241,6 +1254,7 @@ function assemble_regular_galerkin_operators(
     symmetry_mode::Symbol=:off,
     # Read by the CPU branch only; no accelerator backend sees it.
     cpu_regular_kernel::Symbol=:scalar,
+    large_panels=nothing,
 ) where {T<:AbstractFloat}
     if backend == :cpu
         return assemble_regular_galerkin_operators_cpu(
@@ -1260,6 +1274,7 @@ function assemble_regular_galerkin_operators(
             image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=symmetry_mode,
             regular_kernel=cpu_regular_kernel,
+            large_panels=large_panels,
         )
     end
 
@@ -1350,6 +1365,7 @@ function assemble_regular_galerkin_operators(
             image_near_correction_cache=image_near_correction_cache,
             assembly_mode=metal_assembly_mode,
             symmetry_mode=symmetry_mode,
+            large_panels=large_panels,
         )
     end
 
@@ -1767,9 +1783,13 @@ function solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0,
         release_cuda_burton_miller_identity_cache!(identity_cache)
     end
 end
-function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{T}; symmetry_mode::Symbol=:off) where {T<:AbstractFloat}
+function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{T}; symmetry_mode::Symbol=:off, large_panels=nothing) where {T<:AbstractFloat}
     transforms = symmetry_transforms(symmetry_mode; include_identity=true)
-    source_count = length(mesh.faces) * length(rule.points) * length(transforms)
+    source_count = sum(
+        length(_large_panel_rule(large_panels, rule, element_index).points)
+        for element_index in eachindex(mesh.faces);
+        init=0,
+    ) * length(transforms)
     source_points = Vector{SVector{3,T}}(undef, source_count)
     source_normals = Vector{SVector{3,T}}(undef, source_count)
     source_weights = Vector{T}(undef, source_count)
@@ -1782,15 +1802,16 @@ function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{
         vertices = mesh.face_vertices[element_index]
         face = mesh.faces[element_index]
         jac_scale = T(2.0) * mesh.areas[element_index]
+        element_rule = _large_panel_rule(large_panels, rule, element_index)
 
         for transform in transforms
             transformed_vertices = reflect_vertices(transform, vertices)
             transformed_normal = reflect_normal(transform, mesh.normals[element_index])
-            for q_index in eachindex(rule.points)
-                point = rule.points[q_index]
+            for q_index in eachindex(element_rule.points)
+                point = element_rule.points[q_index]
                 source_points[source_index] = local_to_global(transformed_vertices, point)
                 source_normals[source_index] = transformed_normal
-                source_weights[source_index] = rule.weights[q_index] * jac_scale
+                source_weights[source_index] = element_rule.weights[q_index] * jac_scale
                 source_faces[source_index] = face
                 source_elements[source_index] = element_index
                 basis_values[source_index] = p1_values(point)

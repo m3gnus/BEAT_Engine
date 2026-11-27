@@ -29,7 +29,12 @@ function _assemble_regular_galerkin_operators_metal_native(
     near_correction_cache,
     image_near_correction_cache,
     symmetry_mode::Symbol,
+    large_panels=nothing,
 ) where {T<:AbstractFloat}
+    large_panels === nothing || !skip_singular || error("Large-panel integration corrects the singular pass; it cannot skip it.")
+    _large_panel_require_singular_order(large_panels, singular_order)
+    large_panels === nothing || (near_correction_cache === nothing && image_near_correction_cache === nothing) ||
+        error("Large-panel integration and near corrections would both replace the regular rule on the same pairs.")
     normalized_mode = normalized_symmetry_mode(symmetry_mode)
     native_cache = cache === nothing ? build_metal_regular_assembly_cache(
         mesh,
@@ -183,26 +188,30 @@ function _assemble_regular_galerkin_operators_metal_native(
     )
     near_pair_count = sum(c.pair_count for c in near_caches; init=0)
     near_elapsed = @elapsed if near_pair_count > 0
-        Metal.synchronize()
         keys = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
-        host = NamedTuple{keys}(map(keys) do key
-            buffer = getfield(operators, key)
-            Metal.is_shared(buffer) ? unsafe_wrap(Array, buffer) : Array(buffer)
-        end)
-        elements = _beat_cpu_element_data(mesh, p1_space, dp0_space)
-        quadrature = _beat_cpu_regular_quadrature_data(mesh, rule)
-        groups = _beat_cpu_element_color_groups(mesh, indices)
-        for correction in near_caches
-            _beat_cpu_apply_near_cache!(host, mesh, elements, indices, groups,
-                Threads.nthreads() > 1, k, quadrature, correction)
+        _metal_host_edit!(map(key -> getfield(operators, key), keys), mesh, p1_space, dp0_space, rule, indices) do host, elements, quadrature, groups
+            for correction in near_caches
+                _beat_cpu_apply_near_cache!(NamedTuple{keys}(host), mesh, elements, indices, groups,
+                    Threads.nthreads() > 1, k, quadrature, correction)
+            end
         end
-        for key in keys
-            buffer = getfield(operators, key)
-            Metal.is_shared(buffer) || copyto!(buffer, getfield(host, key))
-        end
-        Metal.synchronize()
     end
     timing !== nothing && (timing["metal_host_near_corrections"] = near_elapsed)
+    if large_panels !== nothing
+        panel_elapsed = @elapsed begin
+            keys = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
+            _metal_host_edit!(
+                map(key -> getfield(operators, key), keys), mesh, p1_space, dp0_space, rule, indices,
+            ) do host, elements, quadrature, groups
+                _beat_cpu_apply_large_panels!(
+                    NamedTuple{keys}(host), mesh, large_panels, elements, quadrature,
+                    singular_cache === nothing ? build_singular_correction_cache(mesh, singular_order, indices) : singular_cache,
+                    indices, groups, Threads.nthreads() > 1, native_cache.image_transforms, k,
+                )
+            end
+        end
+        timing !== nothing && (timing["metal_host_large_panels"] = panel_elapsed)
+    end
     weight_elapsed = @elapsed _apply_metal_operator_p1_row_weights!(operators, mesh, normalized_mode)
     timing !== nothing && (timing["metal_native_symmetry_row_weights"] = weight_elapsed)
     total_pairs = length(indices) * length(indices)
@@ -241,6 +250,22 @@ function _assemble_regular_galerkin_operators_metal_native(
     )
 end
 
+# Run a host correction on Metal arrays. Shared buffers are edited in place after
+# synchronizing; private buffers need a round trip.
+function _metal_host_edit!(apply!, buffers, mesh, p1_space, dp0_space, rule, indices)
+    Metal.synchronize()
+    host = map(buffer -> Metal.is_shared(buffer) ? unsafe_wrap(Array, buffer) : Array(buffer), buffers)
+    elements = _beat_cpu_element_data(mesh, p1_space, dp0_space)
+    quadrature = _beat_cpu_regular_quadrature_data(mesh, rule)
+    groups = _beat_cpu_element_color_groups(mesh, indices)
+    apply!(host, elements, quadrature, groups)
+    foreach(buffers, host) do buffer, values
+        Metal.is_shared(buffer) || copyto!(buffer, values)
+    end
+    Metal.synchronize()
+    return nothing
+end
+
 function assemble_regular_galerkin_operators_metal_regular(
     mesh::BoundaryMesh{T},
     p1_space::P1Space,
@@ -260,6 +285,7 @@ function assemble_regular_galerkin_operators_metal_regular(
     image_near_correction_cache=nothing,
     assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
+    large_panels=nothing,
 ) where {T<:AbstractFloat}
     _require_metal!()
     k = outgoing_wavenumber(k)
@@ -284,6 +310,7 @@ function assemble_regular_galerkin_operators_metal_regular(
             near_correction_cache=near_correction_cache,
             image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=symmetry_mode,
+            large_panels=large_panels,
         )
     end
     metal_singular_cache === nothing ||
@@ -307,6 +334,7 @@ function assemble_regular_galerkin_operators_metal_regular(
             near_correction_cache=near_correction_cache,
             image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=normalized_mode,
+            large_panels=large_panels,
         )
     end
     timing !== nothing && (timing["metal_host_assembly"] = host_elapsed)

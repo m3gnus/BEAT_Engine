@@ -16,7 +16,7 @@ end
 # CI gate. Exterior field outputs use a plain loop and explicit method signatures.
 function compiled_driver_closure_types(driver::Module=@__MODULE__)
     producer = compiled_driver_closure_type((:system, :metal_fused_kwargs, :frequencies_hz,
-        :base_rule, :dp0_space, :p1_space, :excitations, :mesh, :density, :sound_speed, :FloatType), driver)
+        :large_panel_rules, :base_rule, :dp0_space, :p1_space, :excitations, :mesh, :density, :sound_speed, :FloatType), driver)
     neumann = compiled_driver_closure_type((:omega, :mesh, :density), driver)
     return (; producer, neumann)
 end

@@ -41,10 +41,12 @@ function metal_host_signatures()
     fused_kwargs = (device_cache=regular, singular_cache=core.SingularCorrectionCache{Float32},
                    device_singular_cache=singular, identity_cache=identity,
                    singular_order=Int, symmetry_mode=Symbol)
-    add(assemble_exterior_direct_metal, fused_args; fused_kwargs...)
-    add(solve_exterior_direct_metal, fused_args; fused_kwargs...)
-    add(core.assemble_burton_miller_neumann_system_metal,
-        (mesh, core.P1Space, core.DP0Space, Matrix{ComplexF32}, Float32, rule); fused_kwargs...)
+    for panels in (Nothing, core.LargePanelPlan{Float32})
+        add(assemble_exterior_direct_metal, fused_args; fused_kwargs..., large_panels=panels)
+        add(solve_exterior_direct_metal, fused_args; fused_kwargs..., large_panels=panels)
+        add(core.assemble_burton_miller_neumann_system_metal,
+            (mesh, core.P1Space, core.DP0Space, Matrix{ComplexF32}, Float32, rule); fused_kwargs..., large_panels=panels)
+    end
     add(core._metal_fused_gather_tables, (regular,))
     add(core._metal_singular_gather_tables, (regular, singular, Int))
     add(core._metal_build_singular_gather_tables, (regular, singular, Int))

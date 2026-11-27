@@ -1048,6 +1048,24 @@ function exterior_output_fields!(fields, output_id, points_by_output, mesh, pres
     return fields[output_id]
 end
 
+"""
+Emit `large_panel_warning` for this frequency unless the request already has,
+as a status event in event mode and on stderr otherwise, where stdout carries
+only results. Returns whether the request has warned.
+"""
+function emit_large_panel_warning(report, frequency_hz, warned::Bool, event_mode::Bool)
+    warned && return true
+    message = large_panel_warning(report, frequency_hz)
+    message === nothing && return false
+    if event_mode
+        println(JSON.json(Dict("type" => "status", "level" => "warning", "message" => message)))
+        flush(stdout)
+    else
+        println(stderr, "Warning: ", message)
+    end
+    return true
+end
+
 function solve_exterior_request(request, system, unbounded_region; event_mode=false)
     meshes = system["meshes"]
     boundaries = system["boundaries"]
@@ -1198,6 +1216,10 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     identity_cache = Dict{Int,Any}(base_order => (identity_p1_p1, identity_p1_dp0))
     cpu_field_cache_by_order = Dict{Int,Any}(base_order => cpu_field_cache)
     cpu_assembly_cache_by_order = Dict{Int,Any}()
+    # Every backend reports large panels; only CPU and Metal integrate them.
+    large_panel_mesh_rules = LargePanelRules(mesh, singular_order)
+    large_panel_rules = backend in (:cpu, :metal) ? large_panel_mesh_rules : nothing
+    large_panel_warned = false
     cancel_path = get(request, "cancel_path", nothing)
     cancel_requested() = cancel_path !== nothing && isfile(String(cancel_path))
     solved_count = 0
@@ -1233,6 +1255,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         neumann_values = [exterior_neumann(mesh, excitation, density, omega) for excitation in excitations]
         system, assembly_s = assemble_exterior_direct_metal(
             mesh, p1_space, dp0_space, neumann_values, wavenumber, base_rule; metal_fused_kwargs...,
+            large_panels=large_panel_plan(large_panel_rules, wavenumber),
         )
         return (system=system, k=wavenumber, assembly_s=assembly_s)
     end
@@ -1241,6 +1264,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     assembly_lookahead = 0
     # The pipelined system being solved, freed by the `finally` if the solve throws.
     current_metal_system = nothing
+    # This frequency's large-panel field sources on Metal, freed the same way.
+    current_panel_field_cache = nothing
     # Metal sweeps leave the assembly producer a core. With BLAS on every
     # performance core the overlapped solve slows by more than the assembly it
     # hides (sample.msh, M1 Pro: 1.38 s overlapped against 1.33 s sequential,
@@ -1289,9 +1314,21 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     ),
                 )
             end : (identity_p1_p1, identity_p1_dp0)
-            selected_field_cache = backend == :cpu ? get!(cpu_field_cache_by_order, selection.order) do
-                build_field_evaluation_cache(mesh, rule; symmetry_mode=symmetry_mode)
-            end : field_cache
+            large_panels = large_panel_plan(large_panel_rules, wavenumber)
+            large_panel_status = large_panel_report(
+                large_panel_mesh_rules, wavenumber, large_panels, LARGE_PANEL_UNSUPPORTED_BACKEND,
+            )
+            large_panel_warned = emit_large_panel_warning(large_panel_status, frequency_hz, large_panel_warned, event_mode)
+            selected_field_cache = if large_panels !== nothing
+                planned_field_cache = build_field_evaluation_cache(mesh, rule; symmetry_mode=symmetry_mode, large_panels=large_panels)
+                backend == :metal ? (current_panel_field_cache = build_metal_field_evaluation_cache(planned_field_cache)) : planned_field_cache
+            elseif backend == :cpu
+                get!(cpu_field_cache_by_order, selection.order) do
+                    build_field_evaluation_cache(mesh, rule; symmetry_mode=symmetry_mode)
+                end
+            else
+                field_cache
+            end
             selected_cpu_cache = backend == :cpu ? get!(cpu_assembly_cache_by_order, selection.order) do
                 build_beat_cpu_assembly_cache(
                     mesh,
@@ -1329,6 +1366,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     singular_order=singular_order, singular_cache=singular_cache,
                     cpu_cache=selected_cpu_cache, symmetry_mode=symmetry_mode,
                     regular_kernel=cpu_regular_kernel, singular_kernel=cpu_singular_kernel,
+                    large_panels=large_panels,
                 )
                 assembly_s = (time_ns() - assembly_started) / 1.0e9
                 solve_started = time_ns()
@@ -1363,7 +1401,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             elseif direct_metal_assembly
                 pressures, assembly_s, solve_s, dense_solve_report = solve_exterior_direct_metal(
                     mesh, p1_space, dp0_space, neumann_values, wavenumber, rule; metal_fused_kwargs...,
-                    sweep_state=dense_sweep_state, frequency=frequency_hz,
+                    sweep_state=dense_sweep_state, frequency=frequency_hz, large_panels=large_panels,
                 )
                 metal_solve_method = dense_solve_report.method
             else
@@ -1386,6 +1424,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
                     symmetry_mode=symmetry_mode,
+                    large_panels=large_panels,
                 )
                 if backend == :metal
                     # Metal has no GPU LU: unified memory lets the host wrap
@@ -1548,6 +1587,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "interface_count" => 0,
                 "regular_quadrature_mode" => selection.mode,
                 "regular_quadrature_order" => selection.order,
+                large_panel_diagnostics(large_panel_status)...,
                 "blas_threads" => cpu_blas_threads,
                 "timings" => Dict(
                     "assembly_s" => assembly_s,
@@ -1590,10 +1630,15 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             flush(stdout)
             operators === nothing || release_operator_storage!(operators)
             current_operators = nothing
+            if current_panel_field_cache !== nothing
+                release_metal_field_evaluation_cache!(current_panel_field_cache)
+                current_panel_field_cache = nothing
+            end
             solved_count = frequency_index
         end
     finally
         shutdown_sweep_assembly_pipeline!(assembly_pipeline, release_produced_system)
+        current_panel_field_cache === nothing || release_metal_field_evaluation_cache!(current_panel_field_cache)
         BLAS.get_num_threads() == process_blas_threads || BLAS.set_num_threads(process_blas_threads)
         if current_metal_system !== nothing
             try
@@ -3186,6 +3231,9 @@ function solve_request_impl(request; event_mode=false)
     )
     metal_field_points = nothing
     pipeline_candidate = use_condensed_solver && coupled_cache !== nothing && length(pipeline_frequencies) > 1
+    # Coupled solves keep the fixed rules; report and warn about large panels.
+    large_panel_mesh_rules = LargePanelRules(bem_mesh, singular_order)
+    large_panel_warned = false
     try
         # CPU exterior fields use BLAB_BEAT_CPU_FIELD_KERNEL (default simd), as exterior-only solves do.
         # Read inside the `try` so an invalid value takes the normal error and cleanup path.
@@ -3200,6 +3248,10 @@ function solve_request_impl(request; event_mode=false)
             end
             frequency_hz = FloatType(frequency_value)
             println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
+            large_panel_status = large_panel_report(
+                large_panel_mesh_rules, FloatType(2pi) * frequency_hz / sound_speed, nothing, LARGE_PANEL_UNSUPPORTED_BACKEND,
+            )
+            large_panel_warned = emit_large_panel_warning(large_panel_status, frequency_hz, large_panel_warned, event_mode)
             assembly_started = time_ns()
             selected_quadrature_order = quadrature_selections === nothing ? quadrature_order :
                                         quadrature_selections[frequency_index].order
@@ -3674,6 +3726,7 @@ function solve_request_impl(request; event_mode=false)
                 rank_experiment_config,
             )
             diagnostics = Dict{String,Any}(
+                large_panel_diagnostics(large_panel_status)...,
                 "precision" => precision_name,
                 "bem_backend" => String(bem_backend),
                 "interface_radiation_boundary_reconstruction_relative_error" => radiation_requested ?
@@ -4108,7 +4161,7 @@ function retained_bem_field_evaluation_cache(
     else
         cpu_cache
     end
-    entry = (mesh=mesh, field_cache=field_cache, backend=backend)
+    entry = (mesh=mesh, field_cache=field_cache, backend=backend, rule=rule)
     BEM_FIELD_EVALUATION_CACHES[cache_key] = entry
     push!(BEM_FIELD_EVALUATION_CACHE_ORDER, cache_key)
     while length(BEM_FIELD_EVALUATION_CACHE_ORDER) > MAX_BEM_FIELD_EVALUATION_CACHES
@@ -4182,6 +4235,22 @@ function evaluate_bem_field_request_impl(request, request_path)
             backend == :rocm ? BeatEngineCore.evaluate_galerkin_field_gradient_rocm :
             BeatEngineCore.evaluate_galerkin_field_gradient_cuda
         return evaluator(points, mesh, pressure, normal_derivative, wavenumber, field_cache; symmetry_mode=symmetry)
+    end
+    # The retained sources hold the base rule. A frequency with large panels
+    # evaluates with this frequency's sources instead, as the solve did.
+    large_panels = backend in (:cpu, :metal) ?
+        large_panel_plan(LargePanelRules(mesh), wavenumber) : nothing
+    if large_panels !== nothing
+        planned = build_field_evaluation_cache(
+            mesh, retained.rule; symmetry_mode=symmetry, large_panels=large_panels,
+        )
+        backend == :cpu && return evaluate_galerkin_field_cpu(points, mesh, pressure, normal_derivative, wavenumber, planned)
+        device_sources = build_metal_field_evaluation_cache(planned)
+        try
+            return evaluate_galerkin_field_metal(points, mesh, pressure, normal_derivative, wavenumber, device_sources)
+        finally
+            release_metal_field_evaluation_cache!(device_sources)
+        end
     end
     if backend == :cuda
         return evaluate_galerkin_field_cuda(

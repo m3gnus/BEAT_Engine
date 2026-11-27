@@ -90,6 +90,20 @@ function observed_metal_signatures()
                 @test !outcome.cancelled
                 @test outcome.solved_count == 2
             end
+            # The tetrahedron's longest edges exceed k*h = 6 at 4 kHz.
+            request = Bundle.workload_request(tiny, "off")
+            request["frequencies_hz"] = [4000.0]
+            request["solver_options"] = merge(Dict{String,Any}(request["solver_options"]), Dict(
+                "bem_backend" => "metal", "quadrature_order" => 4, "singular_order" => 4,
+                "regular_quadrature_mode" => "fixed", "burton_miller_assembly" => "direct_system"))
+            request = JSON.parse(JSON.json(request))
+            outcome = withenv("BLAB_BEAT_LARGE_PANEL_KH" => "6") do
+                redirect_stdout(devnull) do
+                    Bundle.solve_request(request; event_mode=true)
+                end
+            end
+            @test !outcome.cancelled
+            @test outcome.solved_count == 1
         end
     end
     return observed
@@ -120,6 +134,7 @@ end
     core = Bundle.BeatEngineCore
     @test any(signature -> signature[1] === core._metal_fast_field_outputs_kernel!, observed)
     @test any(signature -> signature[1] === core._metal_fast_field_outputs_reduce_kernel!, observed)
+    @test any(signature -> signature[1] === core._metal_large_panel_blocks_kernel!, observed)
     if "--generate" in ARGS
         path = joinpath(dirname(pathof(Bundle)), "MetalKernelSignatures.jl")
         write_metal_signatures(path, observed)

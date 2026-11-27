@@ -562,6 +562,7 @@ function solve_deploy_request_impl(
     request;
     emit_completed::Bool=true,
     rom_initial_pressure=nothing,
+    large_panel_warned::Base.RefValue{Bool}=Ref(false),
 )
     request_started = time()
     request_schema = String(get_value(request, "schema", "boundary_lab_deploy_solve"))
@@ -694,6 +695,14 @@ function solve_deploy_request_impl(
 
     quadrature_order = Int(get_value(request, "quadrature_order", 2))
     singular_order = Int(get_value(request, "singular_order", 3))
+    # Deploy always runs near corrections, which replace the same pairs as the
+    # large-panel correction, so it keeps the fixed rules and says so.
+    large_panel_status = large_panel_report(LargePanelRules(mesh, singular_order), k, nothing, LARGE_PANEL_NEAR_CORRECTION)
+    large_panel_message = large_panel_warning(large_panel_status, frequency)
+    if large_panel_message !== nothing && !large_panel_warned[]
+        emit_event("status"; message=large_panel_message, level="warning")
+        large_panel_warned[] = true
+    end
     close_pair_quadrature_order = Int(get_value(request, "close_pair_quadrature_order", 8))
     close_pair_quadrature_order >= 4 || error("Deploy close-pair quadrature order must be at least 4.")
     proximity = get_value(request, "proximity", Dict{String,Any}())
@@ -1442,6 +1451,7 @@ function solve_deploy_request_impl(
                     "field_s" => Float32(field_seconds),
                 ),
                 "diagnostics" => Dict(
+                    large_panel_diagnostics(large_panel_status)...,
                     "backend" => String(beat_backend),
                     "source_count" => Int(get_value(
                         get_value(request, "provenance", Dict{String,Any}()),
@@ -1670,6 +1680,7 @@ function solve_deploy_microphone_sweep_request_impl(request)
     )
     release_deploy_geometry_state!()
     previous_rom_pressure = nothing
+    large_panel_warned = Ref(false)
     try
         for index in eachindex(frequencies)
             emit_event(
@@ -1710,6 +1721,7 @@ function solve_deploy_microphone_sweep_request_impl(request)
                 frequency_request;
                 emit_completed=false,
                 rom_initial_pressure=rom_frequency_warm_start ? previous_rom_pressure : nothing,
+                large_panel_warned=large_panel_warned,
             )
             if rom_frequency_warm_start
                 state = DEPLOY_BOUNDARY_STATE[]

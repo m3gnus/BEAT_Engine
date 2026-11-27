@@ -292,7 +292,10 @@ function assemble_burton_miller_neumann_system_cpu(
     symmetry_mode::Symbol=:off,
     regular_kernel::Symbol=:scalar,
     singular_kernel::Symbol=:scalar,
+    large_panels=nothing,
 ) where {T<:AbstractFloat}
+    large_panels === nothing || !skip_singular || error("Large-panel integration corrects the singular pass; it cannot skip it.")
+    _large_panel_require_singular_order(large_panels, singular_order)
     regular_kernel = _beat_cpu_validated_regular_kernel(regular_kernel)
     singular_kernel = _beat_cpu_validated_regular_kernel(singular_kernel)
     k = outgoing_wavenumber(k)
@@ -439,6 +442,16 @@ function assemble_burton_miller_neumann_system_cpu(
         end
     end
     timing !== nothing && (timing["fused_image_singular_cpu_scatter"] = image_singular_elapsed)
+
+    if large_panels !== nothing
+        panel_elapsed = @elapsed _beat_cpu_bm_apply_large_panels!(
+            lhs, rhs, q_complex, mesh, large_panels, elements, regular_quadrature,
+            singular_cache === nothing ? build_singular_correction_cache(mesh, singular_order, indices) : singular_cache,
+            indices, color_groups, threaded_enabled, image_transforms, k, coupling,
+            singular_kernel === :simd ? _beat_cpu_duffy_rule_soas : identity,
+        )
+        timing !== nothing && (timing["fused_large_panel_cpu"] = panel_elapsed)
+    end
 
     # Row weights scale the operator part only: `assemble_l2_identity_matrix`
     # already applies them to both identity blocks.

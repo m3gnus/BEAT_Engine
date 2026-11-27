@@ -284,7 +284,7 @@ end
 # `transforms`: one tuple (pair_offsets, singular_trial_indices, skip_mode, 6 signs) per symmetry
 # transform, the identity first. Per chunk, the first transform writes the pair blocks and later ones
 # add into them, so the gathers run once per chunk.
-function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::MetalRegularAssemblyCache, k, transforms, blocks, stage_timings)
+function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::MetalRegularAssemblyCache, k, transforms, blocks, stage_timings, panel_tables=nothing)
     element_count = length(cache.element_indices)
     element_count == 0 && return nothing
     rule_count = cache.rule_count
@@ -317,6 +317,11 @@ function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::M
                 Val(transform_number > 1),
             )
             stamp = _metal_fused_stage!(stage_timings, "fused_pairs", timed, stamp)
+        end
+        if panel_tables !== nothing
+            _launch_metal_large_panel_kernels!(blocks, packed, cache, tables, panel_tables, k, transforms,
+                chunk_start, chunk_count, pair_stride, tile_x, tile_y)
+            stamp = _metal_fused_stage!(stage_timings, "fused_large_panels", timed, stamp)
         end
         _metal_launch(
             _metal_fused_rhs_gather_kernel!,
@@ -630,8 +635,11 @@ function assemble_burton_miller_neumann_system_metal(
     element_indices=eachindex(mesh.faces),
     symmetry_mode::Symbol=:off,
     timing=nothing,
+    large_panels=nothing,
 ) where {T<:AbstractFloat}
     _require_metal!()
+    large_panels === nothing || !skip_singular || error("Large-panel integration corrects the singular pass; it cannot skip it.")
+    _large_panel_require_singular_order(large_panels, singular_order)
     # The kernels combine -D + (i/k) H and -S - (i/k) K' with this k, so the
     # signed outgoing wavenumber carries the convention into the coupling too.
     k = outgoing_wavenumber(k)
@@ -694,8 +702,13 @@ function assemble_burton_miller_neumann_system_metal(
                     T(transform.determinant * transform.signs[2]),
                     T(transform.determinant * transform.signs[3])))
             end
-            _launch_metal_fused_pair_kernels!(lhs, rhs_partial, d_q, device_cache, k, transforms, blocks, stage_timings)
-            Metal.synchronize()
+            panel_tables = large_panels === nothing ? nothing : _metal_large_panel_tables(large_panels, rule, device_cache.element_indices)
+            try
+                _launch_metal_fused_pair_kernels!(lhs, rhs_partial, d_q, device_cache, k, transforms, blocks, stage_timings, panel_tables)
+                Metal.synchronize()
+            finally
+                panel_tables === nothing || _release_metal_large_panel_tables!(panel_tables)
+            end
         end
         timing !== nothing && (timing["metal_fused_regular_kernel"] = kernel_elapsed)
         if timing !== nothing
@@ -746,6 +759,22 @@ function assemble_burton_miller_neumann_system_metal(
             image_singular_pairs = device_cache.image_singular_pair_count
         end
 
+        q_complex = Complex{T}.(Array(q_host))
+        if large_panels !== nothing
+            panel_elapsed = @elapsed _metal_host_edit!(
+                (lhs, rhs), mesh, p1_space, dp0_space, rule, indices,
+            ) do host, elements, quadrature, groups
+                # The pair kernels already moved the regular pairs to their fine rules.
+                _beat_cpu_bm_apply_large_panel_singular!(
+                    host[1], host[2], q_complex, mesh, large_panels,
+                    BeatCpuPanelPasses(mesh, large_panels, elements, quadrature, device_cache.image_transforms),
+                    correction_cache, indices, groups, Threads.nthreads() > 1, device_cache.image_transforms, k,
+                    burton_miller_coupling(k), _beat_cpu_duffy_rule_soas,
+                )
+            end
+            timing !== nothing && (timing["metal_fused_large_panels"] = panel_elapsed)
+        end
+
         # Row weights scale the operator part only, exactly as the four-operator
         # path scales S, K', D and H before the host adds the identity blocks.
         weight_elapsed = @elapsed begin
@@ -765,7 +794,7 @@ function assemble_burton_miller_neumann_system_metal(
         identity_elapsed = @elapsed begin
             scatter_metal_sparse_to_dense!(lhs, identity_cache.p1_p1_scatter; alpha=Complex{T}(0.5), add=true)
             coupling = burton_miller_coupling(k)
-            identity_rhs = (identity_cache.p1_dp0 * Complex{T}.(q_host)) .* (-Complex{T}(0.5) * coupling)
+            identity_rhs = (identity_cache.p1_dp0 * q_complex) .* (-Complex{T}(0.5) * coupling)
             d_identity_rhs = MtlArray(identity_rhs)
             try
                 rhs .+= d_identity_rhs

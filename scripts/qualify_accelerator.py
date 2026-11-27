@@ -67,6 +67,7 @@ if backend == "metal":
     for test in (
         "metal_host_tests.jl",
         "metal_near_correction_tests.jl",
+        "metal_large_panel_tests.jl",
         "metal_kernel_coverage_tests.jl",
         "metal_coupled_precompile_coverage_tests.jl",
     ):

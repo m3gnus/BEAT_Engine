@@ -77,7 +77,6 @@ end
 end
 
 @inline function _metal_packed_trial_term(acc, context, ::Val{Q}, rc, rv::Val{R}) where {Q,R}
-    s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = acc
     x, y, z, test_weight_scale, k, inv_four_pi,
         test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
         points4, trial_index = context
@@ -86,6 +85,16 @@ end
     rb1 = one(k) - xi - eta
     trial_weight = _metal_rule_w(rc, rv, Q)
     @inbounds p = points4[(trial_index - Int32(1)) * Int32(R) + Int32(Q)]
+    return _metal_packed_point_term(acc, p, xi, eta, rb1, trial_weight, x, y, z, test_weight_scale, k, inv_four_pi,
+        test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs)
+end
+
+# One (test point, trial point) term; `p` is the trial point, in its unreflected position.
+@inline function _metal_packed_point_term(
+    acc, p, xi, eta, rb1, trial_weight, x, y, z, test_weight_scale, k, inv_four_pi,
+    test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
+)
+    s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = acc
     sx = p[1].value
     sy = p[2].value
     sz = p[3].value
